@@ -1,8 +1,11 @@
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
+const cookieParser = require('cookie-parser');
 const connectDB = require('./src/config/db');
 const healthRoutes = require('./src/routes/health.routes');
+const authRoutes = require('./src/routes/auth.routes');
+const adminRoutes = require('./src/routes/admin.routes');
 const { notFound, errorHandler } = require('./src/middlewares/errorHandler');
 
 // Load environment variables
@@ -14,7 +17,7 @@ connectDB();
 // Initialize Express app
 const app = express();
 
-// Enable CORS
+// Enable CORS — credentials:true is required for HttpOnly cookies to be sent cross-origin
 app.use(
   cors({
     origin: process.env.CORS_ORIGIN || '*',
@@ -26,8 +29,13 @@ app.use(
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Cookie parser — required for req.cookies to be populated (used by protect middleware)
+app.use(cookieParser());
+
 // Routes
 app.use('/api/v1/health', healthRoutes);
+app.use('/api/v1/auth', authRoutes);
+app.use('/api/v1/admin', adminRoutes);
 
 // 404 & Centralized Error Handlers
 app.use(notFound);

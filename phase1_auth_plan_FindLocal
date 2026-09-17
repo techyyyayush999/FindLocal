@@ -1,0 +1,448 @@
+# Phase 1: Authentication & Authorization — FindLocal
+
+## Overview
+
+This phase adds secure, role-based authentication to the existing Express/MongoDB backend. The approach is deliberate and minimal: standard JWT in `HttpOnly` cookies, bcrypt for passwords, and a clean middleware chain for protecting routes. No Redis, no OAuth, no microservices — just a well-structured pattern a single MERN developer can maintain and explain in an interview.
+
+---
+
+## 1. User Model / Schema
+
+A single `User` collection serves all three roles. Role is stored as a field, not as separate collections. This keeps queries simple and avoids complex joins.
+
+### Fields
+
+| Field | Type | Notes |
+| :--- | :--- | :--- |
+| `name` | String | Required, trimmed |
+| `email` | String | Required, unique, lowercased, indexed |
+| `password` | String | Required, hashed — never returned in responses |
+| `role` | String (enum) | `'customer'` \| `'seller'` \| `'admin'`. Default: `'customer'` |
+| `isVerified` | Boolean | For sellers: admin must approve. Default: `false` for sellers, `true` for customers/admin |
+| `isActive` | Boolean | Soft-ban flag. Default: `true` |
+| `createdAt` / `updatedAt` | Date | Via Mongoose `timestamps: true` |
+
+> [!NOTE]
+> **Why a single User collection?** Three separate collections (Customer, Seller, Admin) would require three auth flows, three middleware checks, and duplicate code. A single `User` model with a `role` field is the MERN standard pattern. You'll explain this in interviews as "single-table role discrimination" or "polymorphic users."
+
+### Mongoose Schema Options
+- `timestamps: true` — auto-manages `createdAt` and `updatedAt`.
+- `select: false` on the `password` field — password is **excluded from all queries by default**. You must explicitly request it only when needed (e.g., during login).
+
+---
+
+## 2. Password Hashing
+
+**Package**: `bcryptjs` (pure JavaScript, no native compilation required — easier on Windows dev environments).
+
+**Strategy**:
+- Hash password in a Mongoose **pre-save hook** on the User model.
+- Salt rounds: `12` (high enough security, acceptable performance).
+- The hook only runs if `password` is **modified** — avoids re-hashing on unrelated document saves.
+- Comparison via `bcryptjs.compare(plainText, hash)` during login.
+
+> [!NOTE]
+> **Why a pre-save hook?** It centralizes hashing logic in the model so no controller can accidentally save a plain-text password. The rule: the model protects the data, the controller handles the flow.
+
+---
+
+## 3. JWT Strategy
+
+**Package**: `jsonwebtoken`
+
+**Token storage**: `HttpOnly` cookie (not `localStorage`).
+
+> [!IMPORTANT]
+> **Why HttpOnly cookies over localStorage?** `localStorage` is accessible via JavaScript, making it vulnerable to XSS attacks. An `HttpOnly` cookie is automatically sent with requests and **cannot** be read by JavaScript, eliminating the XSS vector. For a single-domain MERN app this is the correct choice.
+
+### Token Payload (JWT claims)
+```json
+{
+  "id": "<userId>",
+  "role": "<customer|seller|admin>"
+}
+```
+Keep the payload **minimal**. Never put sensitive data (email, password) in the JWT payload — it is base64-encoded, not encrypted.
+
+### Token Configuration
+
+| Setting | Value | Source |
+| :--- | :--- | :--- |
+| Secret | `JWT_SECRET` | `.env` |
+| Expiry | `JWT_EXPIRES_IN` (e.g. `7d`) | `.env` |
+| Cookie name | `findlocal_token` | constant in code |
+| Cookie flags | `httpOnly: true`, `secure: true` (prod), `sameSite: 'strict'` | set programmatically |
+
+### New `.env` Variables to Add
+```env
+JWT_SECRET=your_super_secret_key_here
+JWT_EXPIRES_IN=7d
+```
+
+---
+
+## 4. Login / Register Flow
+
+### Register (`POST /api/v1/auth/register`)
+
+1. Validate incoming body (`name`, `email`, `password`, `role`).
+2. Check if a user with that email already exists → return `409 Conflict` if so.
+3. Validate `role` is only `customer` or `seller` (admin is seeded, not self-registered).
+4. Create the User document — the pre-save hook hashes the password automatically.
+5. Sign a JWT.
+6. Set the JWT as an `HttpOnly` cookie on the response.
+7. Return user data (omitting `password`).
+
+### Login (`POST /api/v1/auth/login`)
+
+1. Validate incoming body (`email`, `password`).
+2. Find user by email using `.select('+password')` — explicitly request the password field (since it's `select: false` by default).
+3. If user not found → `401 Unauthorized` (generic message — don't distinguish "user not found" from "wrong password" to prevent user enumeration).
+4. Compare submitted password against stored hash using `bcryptjs.compare`.
+5. If mismatch → `401 Unauthorized`.
+6. Check `isActive` flag — if `false` → `403 Forbidden`.
+7. Sign a JWT.
+8. Set `HttpOnly` cookie.
+9. Return user data (omitting `password`).
+
+### Logout (`POST /api/v1/auth/logout`)
+
+1. Overwrite the cookie with an expired one (`maxAge: 0`).
+2. Return `200 OK`.
+
+### Get Current User (`GET /api/v1/auth/me`)
+
+1. Protected by `protect` middleware (see Section 5).
+2. Return `req.user` (populated by middleware).
+
+---
+
+## 5. Authentication Middleware (`protect`)
+
+**File**: `src/middlewares/auth.middleware.js`
+
+**Logic**:
+1. Read the `findlocal_token` cookie from `req.cookies`.
+2. If no token → `401 Unauthorized`.
+3. Verify token using `jwt.verify(token, process.env.JWT_SECRET)`.
+4. If verification fails (expired, tampered) → `401 Unauthorized`.
+5. Fetch the user from DB using `decoded.id` (without password).
+6. If user not found or `isActive === false` → `401 Unauthorized`.
+7. Attach user to `req.user`.
+8. Call `next()`.
+
+> [!NOTE]
+> **Why re-fetch from DB instead of trusting JWT payload?** If an admin bans a user, the JWT is still technically valid until it expires. By checking the DB on every request, you can enforce immediate access revocation via the `isActive` flag. This is the correct approach for a production system.
+
+**Dependency required**: `cookie-parser` (Express middleware to parse `req.cookies`).
+
+---
+
+## 6. RBAC Middleware (`authorize`)
+
+**File**: Same file — `src/middlewares/auth.middleware.js`
+
+A factory function that accepts allowed roles and returns a middleware:
+
+```
+authorize('admin')
+authorize('seller', 'admin')
+authorize('customer', 'seller', 'admin')
+```
+
+**Logic**:
+1. Check `req.user.role` against the array of allowed roles.
+2. If not included → `403 Forbidden` with message `"You do not have permission to perform this action"`.
+3. Call `next()`.
+
+**Usage pattern on routes**:
+```
+router.get('/admin/users', protect, authorize('admin'), getAllUsers);
+router.post('/shops', protect, authorize('seller'), createShop);
+```
+
+> [!NOTE]
+> `protect` always runs before `authorize`. `protect` establishes identity (who are you?), `authorize` establishes permission (what can you do?). These are two separate concerns — never merge them into one middleware.
+
+---
+
+## 7. Seller Ownership Checks
+
+Some resources (shops, products, reservations) belong to a specific seller. Even another seller should not be able to modify them.
+
+**Pattern**: Inline ownership check inside the controller, **not** a separate middleware (keeps it readable for a solo developer).
+
+**Logic inside a seller controller**:
+1. `protect` and `authorize('seller')` have already run.
+2. Fetch the resource (e.g., Shop) by `req.params.id`.
+3. If not found → `404 Not Found`.
+4. Compare `resource.owner.toString() === req.user._id.toString()`.
+5. If mismatch → `403 Forbidden` with message `"You are not authorized to modify this resource"`.
+6. Proceed with the update/delete.
+
+> [!NOTE]
+> `.toString()` is required because MongoDB ObjectIds are objects, not strings. Direct `===` comparison will always fail. This is one of the most common beginner bugs in MERN apps.
+
+---
+
+## 8. API Endpoints
+
+### Auth Routes — `/api/v1/auth`
+
+| Method | Endpoint | Access | Description |
+| :--- | :--- | :--- | :--- |
+| `POST` | `/register` | Public | Register as customer or seller |
+| `POST` | `/login` | Public | Login for all roles |
+| `POST` | `/logout` | Protected | Clear auth cookie |
+| `GET` | `/me` | Protected | Get current user profile |
+
+### User Management Routes — `/api/v1/admin/users`
+
+| Method | Endpoint | Access | Description |
+| :--- | :--- | :--- | :--- |
+| `GET` | `/` | Admin | Get all users |
+| `GET` | `/:id` | Admin | Get a specific user |
+| `PATCH` | `/:id/status` | Admin | Activate/deactivate a user (`isActive`) |
+
+> [!NOTE]
+> All further resource routes (shops, products, reservations) are Phase 2+. Only Auth and basic Admin User Management go in Phase 1.
+
+---
+
+## 9. Request / Response Structure
+
+### Register Request Body
+```json
+{
+  "name": "Ayush Sharma",
+  "email": "ayush@example.com",
+  "password": "MySecurePass123",
+  "role": "customer"
+}
+```
+
+### Login Request Body
+```json
+{
+  "email": "ayush@example.com",
+  "password": "MySecurePass123"
+}
+```
+
+### Success Response (Register / Login)
+```json
+{
+  "success": true,
+  "message": "Logged in successfully",
+  "data": {
+    "user": {
+      "_id": "...",
+      "name": "Ayush Sharma",
+      "email": "ayush@example.com",
+      "role": "customer",
+      "isActive": true,
+      "createdAt": "..."
+    }
+  }
+}
+```
+> [!IMPORTANT]
+> `password` is **never** returned. The cookie is set via `res.cookie(...)`, not in the response body.
+
+### Error Response
+```json
+{
+  "success": false,
+  "message": "Invalid email or password"
+}
+```
+Handled by the centralized `errorHandler` middleware already in place from Phase 0.
+
+---
+
+## 10. Validation Strategy
+
+**Package**: `express-validator`
+
+> [!NOTE]
+> **Why express-validator over Joi?** `express-validator` integrates directly into Express route definitions with minimal boilerplate. Joi requires a separate schema object per route. For a solo MERN developer, `express-validator` is easier to read and maintain inline with routes.
+
+### Approach
+- Create a reusable validation middleware factory per route.
+- File: `src/middlewares/validate.middleware.js` — a utility that calls `validationResult(req)` and forwards errors to `next()` as a formatted 400 response.
+- Define validation rules per route in `src/validators/auth.validators.js`.
+
+### Rules for Register
+- `name`: required, non-empty, max 100 chars.
+- `email`: required, valid email format, normalized.
+- `password`: required, min 8 chars (optionally enforce complexity).
+- `role`: optional, must be `customer` or `seller` if provided.
+
+### Rules for Login
+- `email`: required, valid email format.
+- `password`: required, non-empty.
+
+---
+
+## 11. Error Handling
+
+Reuse the existing `errorHandler` and `notFound` middlewares from Phase 0. No changes needed to those.
+
+### HTTP Status Code Conventions
+
+| Scenario | Status Code |
+| :--- | :--- |
+| Validation failure | `400 Bad Request` |
+| Invalid credentials | `401 Unauthorized` |
+| Role not permitted / banned | `403 Forbidden` |
+| Resource not found | `404 Not Found` |
+| Email already registered | `409 Conflict` |
+| Server/DB error | `500 Internal Server Error` |
+
+### Throwing errors in controllers
+Use `const error = new Error('message'); error.statusCode = 403; throw error;` inside async controllers wrapped with a centralized `asyncHandler` utility — avoids `try/catch` boilerplate in every controller.
+
+**File**: `src/utils/asyncHandler.js` — a simple wrapper: `(fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);`
+
+---
+
+## 12. Security Considerations
+
+| Concern | Mitigation |
+| :--- | :--- |
+| XSS token theft | JWT stored in `HttpOnly` cookie |
+| CSRF attacks | `sameSite: 'strict'` cookie flag; same-origin frontend |
+| Password exposure | `select: false` on password field; never return in responses |
+| User enumeration | Same `401` message for "not found" and "wrong password" |
+| Brute force | Out of scope for Phase 1; can add `express-rate-limit` later |
+| Plain-text passwords | bcrypt pre-save hook; never stored plain |
+| JWT tampering | `jwt.verify` with secret; invalid tokens → 401 |
+| Sensitive env vars | `JWT_SECRET` in `.env`, gitignored |
+| Admin self-registration | `role: 'admin'` is not accepted in register endpoint |
+
+---
+
+## 13. Required npm Packages
+
+### Production Dependencies
+
+| Package | Version | Purpose |
+| :--- | :--- | :--- |
+| `bcryptjs` | latest | Password hashing |
+| `jsonwebtoken` | latest | JWT signing and verification |
+| `cookie-parser` | latest | Parse `HttpOnly` cookies from `req.cookies` |
+| `express-validator` | latest | Input validation |
+
+```bash
+npm install bcryptjs jsonwebtoken cookie-parser express-validator
+```
+
+No other packages are needed. All other requirements (express, mongoose, dotenv, cors) are already installed.
+
+---
+
+## 14. Exact Backend Folder / File Structure
+
+Only **new** files and modifications to **existing** files are listed. Nothing else changes.
+
+```
+server/
+├── .env                          ← MODIFY: add JWT_SECRET, JWT_EXPIRES_IN
+├── .env.example                  ← MODIFY: add JWT_SECRET, JWT_EXPIRES_IN
+├── server.js                     ← MODIFY: add cookie-parser, mount auth & admin routes
+├── src/
+│   ├── config/
+│   │   └── db.js                 (unchanged)
+│   ├── controllers/
+│   │   ├── health.controller.js  (unchanged)
+│   │   ├── auth.controller.js    ← NEW: register, login, logout, getMe
+│   │   └── user.controller.js    ← NEW: getAllUsers, getUserById, updateUserStatus
+│   ├── middlewares/
+│   │   ├── errorHandler.js       (unchanged)
+│   │   ├── auth.middleware.js    ← NEW: protect, authorize
+│   │   └── validate.middleware.js← NEW: validationResult runner
+│   ├── models/
+│   │   └── User.model.js         ← NEW: User schema with pre-save hook
+│   ├── routes/
+│   │   ├── health.routes.js      (unchanged)
+│   │   ├── auth.routes.js        ← NEW: /register, /login, /logout, /me
+│   │   └── admin.routes.js       ← NEW: /admin/users (admin-only user management)
+│   ├── utils/
+│   │   └── asyncHandler.js       ← NEW: async error wrapper utility
+│   ├── validators/
+│   │   └── auth.validators.js    ← NEW: express-validator rule sets
+│   └── services/                 (empty, .gitkeep — unchanged)
+```
+
+> [!NOTE]
+> A `validators/` directory is added at the same level as `models/` and `controllers/`. This keeps validation rules separate from route and controller logic — a clean separation of concerns.
+
+---
+
+## 15. Testing Plan
+
+All tests are manual (no test framework in Phase 1 — keep it simple).
+
+### A. Unit Tests (Manual via curl / Postman / Thunder Client)
+
+| # | Test | Expected |
+| :--- | :--- | :--- |
+| 1 | `POST /auth/register` — valid customer | `201`, user object, cookie set |
+| 2 | `POST /auth/register` — duplicate email | `409 Conflict` |
+| 3 | `POST /auth/register` — invalid email format | `400` with validation errors |
+| 4 | `POST /auth/register` — role=admin | `400` rejected |
+| 5 | `POST /auth/login` — correct credentials | `200`, cookie set |
+| 6 | `POST /auth/login` — wrong password | `401` |
+| 7 | `POST /auth/login` — non-existent email | `401` (same message as wrong password) |
+| 8 | `GET /auth/me` — with valid cookie | `200`, user data |
+| 9 | `GET /auth/me` — no cookie | `401` |
+| 10 | `POST /auth/logout` | `200`, cookie cleared |
+| 11 | `GET /admin/users` — as admin | `200`, user list |
+| 12 | `GET /admin/users` — as customer | `403 Forbidden` |
+| 13 | `PATCH /admin/users/:id/status` — as admin | `200`, status toggled |
+| 14 | `GET /api/v1/unknown-route` | `404`, JSON error |
+| 15 | Verify password not in response body | `password` field absent from all responses |
+| 16 | Verify cookie is HttpOnly | Cookie header shows `HttpOnly` flag |
+
+### B. Integration Verification
+
+- Start server via `npm run dev`.
+- Confirm no startup errors.
+- Confirm MongoDB connection message.
+- Confirm existing `GET /api/v1/health` still returns 200 (regression check).
+
+---
+
+## 16. Common Beginner Mistakes to Avoid
+
+| # | Mistake | Correct Approach |
+| :--- | :--- | :--- |
+| 1 | Storing JWT in `localStorage` | Use `HttpOnly` cookies |
+| 2 | Returning `password` in API responses | Use `select: false` + never include in `.toJSON()` |
+| 3 | Comparing ObjectIds with `===` | Always use `.toString()` on both sides |
+| 4 | Hashing password in the controller | Hash in the Mongoose pre-save hook |
+| 5 | Re-hashing password on non-password updates | Check `if (this.isModified('password'))` in the hook |
+| 6 | Using `role: 'admin'` in the register endpoint | Block admin self-registration explicitly |
+| 7 | Giving different 401 messages for "user not found" vs "wrong password" | Same message always — prevents user enumeration |
+| 8 | Trusting JWT payload without DB re-fetch | Always re-fetch user in `protect` to catch bans/deletions |
+| 9 | Skipping `await` on async Mongoose calls | Every `.find()`, `.save()`, `.create()` is async |
+| 10 | Forgetting `cookie-parser` in `server.js` | `req.cookies` will be `undefined` without it |
+| 11 | Hardcoding `JWT_SECRET` in source code | Always from `process.env.JWT_SECRET` |
+| 12 | Not setting `secure: true` in production cookies | Cookies sent over HTTP in production are interceptable |
+| 13 | Merging `protect` and `authorize` into one middleware | Keep identity (protect) and permission (authorize) separate |
+| 14 | Checking ownership in middleware instead of controller | Ownership depends on resource type; do it in the controller |
+| 15 | Using `delete user.password` on a Mongoose doc | Use `select: false` or `.toObject()` + `delete`; Mongoose docs don't behave like plain objects |
+
+---
+
+## Key Architecture Decisions Summary
+
+| Decision | Rationale |
+| :--- | :--- |
+| Single User collection | Avoids duplicate auth logic; role field is clean and queryable |
+| HttpOnly cookies | Eliminates XSS token theft; no CORS token header management |
+| `select: false` on password | Defence-in-depth; password never leaks accidentally |
+| DB re-fetch in `protect` | Enables immediate access revocation without token blacklist |
+| `asyncHandler` utility | Eliminates repetitive `try/catch` in every controller |
+| `validators/` directory | Clean separation; validation rules don't pollute routes or controllers |
+| No Redis / no refresh tokens | Out of scope; 7-day JWT is acceptable for a startup MERN app |
