@@ -1,5 +1,6 @@
 const express = require('express');
 const { getAllUsers, getUserById, updateUserStatus } = require('../controllers/user.controller');
+const { adminGetAllShops, adminGetShopById, adminVerifyShop } = require('../controllers/shop.controller');
 const { protect, authorize } = require('../middlewares/auth.middleware');
 
 const router = express.Router();
@@ -8,8 +9,14 @@ const router = express.Router();
 // protect runs first to establish identity; authorize then checks the role.
 router.use(protect, authorize('admin'));
 
+// ─── User management ──────────────────────────────────────────────────────────
 router.get('/users', getAllUsers);
 router.get('/users/:id', getUserById);
 router.patch('/users/:id/status', updateUserStatus);
+
+// ─── Shop management ──────────────────────────────────────────────────────────
+router.get('/shops', adminGetAllShops);
+router.get('/shops/:id', adminGetShopById);
+router.patch('/shops/:id/verify', adminVerifyShop);
 
 module.exports = router;
