@@ -91,6 +91,15 @@ const updateShopRules = [
     .isFloat({ min: -90, max: 90 })
     .withMessage('Latitude must be between -90 and 90'),
 
+  body().custom((value, { req }) => {
+    const hasLng = req.body.longitude !== undefined;
+    const hasLat = req.body.latitude !== undefined;
+    if ((hasLng && !hasLat) || (!hasLng && hasLat)) {
+      throw new Error('Both longitude and latitude must be provided together, or neither.');
+    }
+    return true;
+  }),
+
   body('isOpen')
     .optional()
     .isBoolean()
@@ -118,4 +127,21 @@ const nearbyQueryRules = [
     .withMessage('radius must be between 100 and 50000 meters'),
 ];
 
-module.exports = { createShopRules, updateShopRules, nearbyQueryRules };
+// ─── ObjectId Param Rule ───────────────────────────────────────────────────────
+// Validates a route param `id` is a 24-hex MongoDB ObjectId.
+// Returns 400 via the standard validate middleware on mismatch.
+const objectIdParamRules = [
+  (req, res, next) => {
+    const id = req.params.id;
+    if (typeof id !== 'string' || !/^[0-9a-fA-F]{24}$/.test(id)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation failed',
+        errors: [{ field: 'id', message: 'Invalid ID format. Must be a valid MongoDB ObjectId.' }],
+      });
+    }
+    next();
+  },
+];
+
+module.exports = { createShopRules, updateShopRules, nearbyQueryRules, objectIdParamRules };

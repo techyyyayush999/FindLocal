@@ -2,6 +2,7 @@ const express = require('express');
 const { getAllUsers, getUserById, updateUserStatus } = require('../controllers/user.controller');
 const { adminGetAllShops, adminGetShopById, adminVerifyShop } = require('../controllers/shop.controller');
 const { protect, authorize } = require('../middlewares/auth.middleware');
+const { objectIdParamRules } = require('../validators/shop.validators');
 
 const router = express.Router();
 
@@ -16,7 +17,7 @@ router.patch('/users/:id/status', updateUserStatus);
 
 // ─── Shop management ──────────────────────────────────────────────────────────
 router.get('/shops', adminGetAllShops);
-router.get('/shops/:id', adminGetShopById);
-router.patch('/shops/:id/verify', adminVerifyShop);
+router.get('/shops/:id', objectIdParamRules, adminGetShopById);
+router.patch('/shops/:id/verify', objectIdParamRules, adminVerifyShop);
 
 module.exports = router;

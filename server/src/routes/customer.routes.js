@@ -1,7 +1,7 @@
 const express = require('express');
 const { getAllShops, getShopById, getNearbyShops } = require('../controllers/shop.controller');
 const validate = require('../middlewares/validate.middleware');
-const { nearbyQueryRules } = require('../validators/shop.validators');
+const { nearbyQueryRules, objectIdParamRules } = require('../validators/shop.validators');
 
 const router = express.Router();
 
@@ -21,6 +21,6 @@ router.get('/', getAllShops);
 
 // ─── GET /api/v1/shops/:id ────────────────────────────────────────────────────
 // Returns a single verified shop by MongoDB ObjectId
-router.get('/:id', getShopById);
+router.get('/:id', objectIdParamRules, getShopById);
 
 module.exports = router;
