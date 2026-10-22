@@ -2,3 +2,11 @@ node_modules/
 .env
 .DS_Store
 *.log
+
+# Local test payloads and credentials
+/payload_*.json
+
+# Temporary Phase 2 test utilities
+/ph2test.ps1
+/reset_ph2.js
+/seed_admin.js
