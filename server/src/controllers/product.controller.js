@@ -1,4 +1,6 @@
 const Product = require('../models/Product.model');
+const Inventory = require('../models/Inventory.model');
+const Shop = require('../models/Shop.model');
 const asyncHandler = require('../utils/asyncHandler');
 const { generateSlug } = require('../utils/productNormalizer');
 const {
@@ -446,7 +448,137 @@ const updateProductStatus = asyncHandler(async (req, res) => {
   });
 });
 
+
+// GET /api/v1/products/search
+const searchProducts = asyncHandler(async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  const lat = Number(req.query.lat);
+  const lng = Number(req.query.lng);
+  const radius = Number(req.query.radius) || 5000;
+  const { page, limit, skip } = parsePagination(req.query);
+  const sortBy = req.query.sort === 'price' ? 'price' : 'distance';
+
+  // Escape regex metacharacters so user input is treated as plain text.
+  const escapedQuery = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  const pipeline = [
+    {
+      $geoNear: {
+        near: {
+          type: 'Point',
+          coordinates: [lng, lat],
+        },
+        distanceField: 'distanceMeters',
+        maxDistance: radius,
+        spherical: true,
+        query: { isVerified: true },
+      },
+    },
+    {
+      $lookup: {
+        from: Inventory.collection.name,
+        localField: '_id',
+        foreignField: 'shop',
+        as: 'inventory',
+      },
+    },
+    { $unwind: '$inventory' },
+    {
+      $match: {
+        'inventory.isActive': true,
+      },
+    },
+    {
+      $lookup: {
+        from: Product.collection.name,
+        localField: 'inventory.product',
+        foreignField: '_id',
+        as: 'product',
+      },
+    },
+    { $unwind: '$product' },
+    {
+      $match: {
+        'product.status': PRODUCT_STATUSES.ACTIVE,
+        'product.name': { $regex: escapedQuery, $options: 'i' },
+      },
+    },
+    {
+      $addFields: {
+        availableQuantity: {
+          $subtract: [
+            '$inventory.quantity',
+            { $ifNull: ['$inventory.reservedQuantity', 0] },
+          ],
+        },
+        price: { $divide: ['$inventory.pricePaise', 100] },
+        distanceKm: { $divide: ['$distanceMeters', 1000] },
+      },
+    },
+    {
+      $addFields: {
+        stockStatus: {
+          $cond: [
+            { $gt: ['$availableQuantity', 0] },
+            'In stock',
+            'Out of stock',
+          ],
+        },
+      },
+    },
+    {
+      $project: {
+        _id: 0,
+        product: {
+          _id: '$product._id',
+          name: '$product.name',
+          brand: '$product.brand',
+          category: '$product.category',
+          slug: '$product.slug',
+        },
+        shop: {
+          _id: '$_id',
+          name: '$name',
+          address: '$address',
+          isOpen: '$isOpen',
+        },
+        pricePaise: '$inventory.pricePaise',
+        price: 1,
+        availableQuantity: 1,
+        stockStatus: 1,
+        distanceMeters: 1,
+        distanceKm: 1,
+      },
+    },
+    {
+      $sort: sortBy === 'price'
+        ? { pricePaise: 1, distanceMeters: 1 }
+        : { distanceMeters: 1, pricePaise: 1 },
+    },
+    {
+      $facet: {
+        metadata: [{ $count: 'total' }],
+        results: [{ $skip: skip }, { $limit: limit }],
+      },
+    },
+  ];
+
+  const [output] = await Shop.aggregate(pipeline);
+  const results = output?.results || [];
+  const total = output?.metadata?.[0]?.total || 0;
+
+  res.status(200).json({
+    success: true,
+    count: results.length,
+    total,
+    page,
+    pages: Math.ceil(total / limit),
+    data: { results },
+  });
+});
+
 module.exports = {
+  searchProducts,
   createProduct,
   getProducts,
   getMyProducts,

@@ -7,6 +7,7 @@ const {
   getProductById,
   updateProduct,
   updateProductStatus,
+  searchProducts,
 } = require('../controllers/product.controller');
 const { protect, authorize } = require('../middlewares/auth.middleware');
 const validate = require('../middlewares/validate.middleware');
@@ -18,6 +19,7 @@ const {
   myProductsListRules,
   adminProductsListRules,
   productIdParamRules,
+  productSearchRules,
 } = require('../validators/product.validators');
 
 const router = express.Router();
@@ -66,7 +68,14 @@ router.get(
   getProducts
 );
 
-// ─── GET /api/v1/products/:id ────────────────────────────────────────────────
+// ─── GET /api/v1/products/search ────────────────────────────────────────────────
+router.get(
+  '/search',
+  productSearchRules,
+  validate,
+  searchProducts
+);
+
 // Product detail (visibility depends on role and status)
 router.get(
   '/:id',

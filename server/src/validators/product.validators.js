@@ -243,7 +243,47 @@ const productIdParamRules = [
   },
 ];
 
+const productSearchRules = [
+  query('q')
+    .isString()
+    .withMessage('Search query q is required')
+    .bail()
+    .trim()
+    .isLength({ min: 2, max: 100 })
+    .withMessage('Search query must be between 2 and 100 characters'),
+
+  query('lat')
+    .exists()
+    .withMessage('Latitude lat is required')
+    .bail()
+    .isFloat({ min: -90, max: 90 })
+    .withMessage('Latitude must be between -90 and 90')
+    .toFloat(),
+
+  query('lng')
+    .exists()
+    .withMessage('Longitude lng is required')
+    .bail()
+    .isFloat({ min: -180, max: 180 })
+    .withMessage('Longitude must be between -180 and 180')
+    .toFloat(),
+
+  query('radius')
+    .optional()
+    .isInt({ min: 100, max: 50000 })
+    .withMessage('Radius must be between 100 and 50000 metres')
+    .toInt(),
+
+  query('sort')
+    .optional()
+    .isIn(['distance', 'price'])
+    .withMessage('Sort must be distance or price'),
+
+  ...paginationRules,
+];
+
 module.exports = {
+  productSearchRules,
   createProductRules,
   updateProductRules,
   statusUpdateRules,
