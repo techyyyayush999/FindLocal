@@ -2,8 +2,10 @@ const express = require('express');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
 const helmet = require('helmet');
+const mongoose = require('mongoose');
 const { assertValidEnv } = require('./src/config/env');
 const connectDB = require('./src/config/db');
+const { createGracefulShutdown } = require('./src/utils/gracefulShutdown');
 const healthRoutes = require('./src/routes/health.routes');
 const authRoutes = require('./src/routes/auth.routes');
 const adminRoutes = require('./src/routes/admin.routes');
@@ -33,9 +35,6 @@ try {
   console.error('Server startup aborted due to invalid configuration.');
   process.exit(1);
 }
-
-// Connect to MongoDB
-connectDB();
 
 // Initialize Express app
 const app = express();
@@ -93,6 +92,7 @@ app.use(errorHandler);
 
 // Server listener
 const PORT = envConfig.port;
+const NODE_ENV = process.env.NODE_ENV || 'development';
 
 // Background reservation expiry sweep (F1): releases held stock exactly once and
 // closes expired reservations as EXPIRED via the idempotent settlement path. It is
@@ -103,9 +103,36 @@ const expirySweeper = createExpirySweeper({
   limit: Number(process.env.EXPIRY_SWEEP_LIMIT || 200),
 });
 
-app.listen(PORT, () => {
-  console.log(`FindLocal server running in ${process.env.NODE_ENV || 'development'} mode on port ${PORT}`);
-  expirySweeper.start();
+// ─── Startup ───────────────────────────────────────────────────────────────────
+// The HTTP server starts listening only AFTER MongoDB is connected, so the API
+// never accepts traffic it cannot serve and readiness can be trusted.
+async function startServer() {
+  await connectDB(); // throws on failure — handled by the caller below
+
+  const server = app.listen(PORT, () => {
+    console.log(`FindLocal server running in ${NODE_ENV} mode on port ${PORT}`);
+    expirySweeper.start();
+  });
+
+  const { shutdown } = createGracefulShutdown({
+    server,
+    connection: mongoose.connection,
+    sweeper: expirySweeper,
+    timeoutMs: Number(process.env.SHUTDOWN_TIMEOUT_MS || 10000),
+  });
+
+  // Idempotent: repeated signals are ignored by the shutdown routine itself.
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  return server;
+}
+
+startServer().catch((error) => {
+  // Sanitized: never echo MONGO_URI/credentials or raw driver output.
+  const reason = error && error.name ? error.name : 'Error';
+  console.error(`Server startup failed (${reason}): database is unavailable.`);
+  process.exit(1);
 });
 
 module.exports = app;
