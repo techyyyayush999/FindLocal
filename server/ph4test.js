@@ -20,8 +20,14 @@
 const http = require('http');
 const mongoose = require('mongoose');
 const path = require('path');
+const { spawn } = require('child_process');
 
-const BASE_URL = 'http://localhost:5000';
+require('dotenv').config({ path: path.join(__dirname, '.env') });
+
+// Base URL of the API under test. Keeps the historical default; the isolation
+// harness below overrides it to a dedicated test port unless PH4_TEST_BASE_URL is
+// supplied to target an already-running server.
+let BASE_URL = process.env.PH4_TEST_BASE_URL || 'http://localhost:5000';
 const SELLER_EMAIL = 'seller_ph2@x.com';
 const SELLER_PASSWORD = 'TestPass123!';
 const TARGET_PRODUCT_ID = '6accd904013f7da15e7f50c2';
@@ -31,6 +37,166 @@ let PRODUCT_ID = '';
 let INVENTORY_ID = '';
 let SELLER_SHOP_ID = '';
 let createReturned201 = false;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Isolation harness
+// By default this script runs against its OWN server on a dedicated port backed by
+// a per-run database derived from MONGO_URI, seeds the required seller / verified
+// shop / target product there, and drops ONLY that database at the end — it never
+// touches the shared development database. Set PH4_TEST_BASE_URL to target an
+// already-running server instead (this disables the spawn / seed / drop harness).
+// ══════════════════════════════════════════════════════════════════════════════
+const RUN_SUFFIX = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+
+function deriveTestUri(uri, suffix) {
+  const u = new URL(uri);
+  const baseName = u.pathname.replace(/^\//, '') || 'findlocal';
+  u.pathname = `/${baseName}_ph4test_${suffix}`;
+  return { uri: u.toString(), dbName: u.pathname.slice(1), baseName };
+}
+
+const BASE_DB_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/findlocal';
+const EXTERNAL_BASE = process.env.PH4_TEST_BASE_URL || null;
+const TEST_PORT = Number(process.env.PH4_TEST_PORT || 5014);
+const { uri: TEST_URI, dbName: TEST_DB_NAME, baseName: BASE_DB_NAME } =
+  deriveTestUri(BASE_DB_URI, RUN_SUFFIX);
+
+if (!EXTERNAL_BASE) {
+  BASE_URL = `http://localhost:${TEST_PORT}`;
+  // Ensure this script's own DB helpers (cleanup) target the isolated database.
+  process.env.MONGO_URI = TEST_URI;
+}
+
+let testServer = null;
+let dbConnected = false;
+
+async function waitForHealth(timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const res = await request('GET', '/api/v1/health');
+      if (res.status === 200) return true;
+    } catch {
+      /* not up yet */
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return false;
+}
+
+// Seed the users / shop / product this suite assumes into the isolated database.
+async function seedFixtures() {
+  const User = require('./src/models/User.model');
+  const Shop = require('./src/models/Shop.model');
+  const Product = require('./src/models/Product.model');
+  await Promise.all([User.init(), Shop.init(), Product.init()]);
+
+  let seller = await User.findOne({ email: SELLER_EMAIL });
+  if (!seller) {
+    seller = await User.create({
+      name: 'Phase 4 Seller',
+      email: SELLER_EMAIL,
+      password: SELLER_PASSWORD,
+      role: 'seller',
+      isVerified: true,
+      isActive: true,
+    });
+  }
+
+  let shop = await Shop.findOne({ owner: seller._id });
+  if (!shop) {
+    shop = await Shop.create({
+      owner: seller._id,
+      name: 'Phase 4 Shop',
+      address: 'Phase 4 Test Address',
+      location: { type: 'Point', coordinates: [77.209, 28.6139] },
+      isVerified: true,
+      isOpen: true,
+    });
+  }
+
+  const existingProduct = await Product.findById(TARGET_PRODUCT_ID);
+  if (!existingProduct) {
+    await Product.create({
+      _id: new mongoose.Types.ObjectId(TARGET_PRODUCT_ID),
+      name: 'Phase 4 Target Product',
+      brand: 'Phase4Brand',
+      category: 'other',
+      status: 'ACTIVE',
+      createdBy: seller._id,
+    });
+  }
+}
+
+async function startIsolatedServer() {
+  if (EXTERNAL_BASE) {
+    console.log(`  Using external server at ${EXTERNAL_BASE} (no spawn / no DB drop).`);
+    return;
+  }
+
+  console.log(`  Base database (from .env): ${BASE_DB_NAME}`);
+  console.log(`  Isolated test database:    ${TEST_DB_NAME}`);
+  console.log(`  Dedicated test port:       ${TEST_PORT}`);
+
+  await mongoose.connect(TEST_URI);
+  dbConnected = true;
+  if (mongoose.connection.name !== TEST_DB_NAME) {
+    throw new Error(
+      `Refusing to run: connected to ${mongoose.connection.name}, expected ${TEST_DB_NAME}`
+    );
+  }
+  await seedFixtures();
+  console.log(`  Seller / verified shop / target product seeded into ${TEST_DB_NAME}.`);
+
+  testServer = spawn(process.execPath, ['server.js'], {
+    cwd: __dirname,
+    env: {
+      ...process.env,
+      MONGO_URI: TEST_URI,
+      PORT: String(TEST_PORT),
+      NODE_ENV: 'test',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  let serverOutput = '';
+  testServer.stdout.on('data', (d) => (serverOutput += d.toString()));
+  testServer.stderr.on('data', (d) => (serverOutput += d.toString()));
+
+  const ready = await waitForHealth();
+  if (!ready) {
+    console.error(serverOutput.trim());
+    throw new Error(`Isolated API server did not become healthy on port ${TEST_PORT}`);
+  }
+  console.log(`  Isolated API server ready on port ${TEST_PORT}.`);
+}
+
+async function stopIsolatedServer() {
+  if (testServer && !testServer.killed) {
+    try {
+      testServer.kill();
+    } catch {
+      /* ignore */
+    }
+  }
+  if (dbConnected) {
+    try {
+      // The test's own cleanup disconnects mongoose; reconnect to drop the DB.
+      if (mongoose.connection.readyState === 0) await mongoose.connect(TEST_URI);
+      await mongoose.connection.db.dropDatabase();
+      console.log(`  Dropped isolated test database: ${TEST_DB_NAME}`);
+    } catch (err) {
+      console.error(`  Cleanup failed: ${err.message}`);
+    }
+    try {
+      await mongoose.disconnect();
+    } catch {
+      /* ignore */
+    }
+    dbConnected = false;
+  }
+}
+
 
 let passed = 0;
 let failed = 0;
@@ -652,6 +818,7 @@ async function main() {
   console.log('\n=== FindLocal Phase 4 Inventory Tests ===');
 
   try {
+    await startIsolatedServer();
     await loginAsSeller();
     await fetchSellerShopId();
     await findActiveProduct();
@@ -675,6 +842,9 @@ async function main() {
       console.error('Cleanup failed; test data may remain.');
       failed++;
     }
+
+    // Terminate the dedicated test server and drop ONLY the isolated database.
+    await stopIsolatedServer();
   }
 
   console.log('\n========================================');

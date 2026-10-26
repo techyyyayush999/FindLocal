@@ -1,6 +1,12 @@
 const mongoose = require('mongoose');
 const { INVENTORY_BOUNDS } = require('../constants/inventoryConstants');
 
+// ─── Serialization guard: never expose internal stock-hold bookkeeping ────────
+const stripInternalFields = (doc, ret) => {
+  delete ret.heldReservations;
+  return ret;
+};
+
 const inventorySchema = new mongoose.Schema(
   {
     // ─── Shop Reference (derived server-side, never client-supplied) ────────────
@@ -57,11 +63,23 @@ const inventorySchema = new mongoose.Schema(
       type: Boolean,
       default: true,
     },
+
+    // ─── Internal Stock-Hold Ledger (never client-editable, never exposed) ──────
+    // Per-reservation evidence that a stock hold has been applied. Mutated
+    // ATOMICALLY together with reservedQuantity so a retry or reconciler can
+    // always tell whether a specific reservation's claim already landed — without
+    // a grace period and without double-counting. Excluded from reads by default;
+    // opt in with `.select('+heldReservations')`.
+    heldReservations: {
+      type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Reservation' }],
+      default: [],
+      select: false,
+    },
   },
   {
     timestamps: true,
-    toJSON: { virtuals: true },
-    toObject: { virtuals: true },
+    toJSON: { virtuals: true, transform: stripInternalFields },
+    toObject: { virtuals: true, transform: stripInternalFields },
   }
 );
 

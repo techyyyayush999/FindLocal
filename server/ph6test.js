@@ -6,10 +6,12 @@
  * plus backward-compatibility of the Phase 5 defaults.
  *
  * Prerequisites:
- *   - Backend running at localhost:5000
- *   - MongoDB configured in server/.env
- *   - Admin user seeded (admin@findlocal.dev / Admin@12345)
- *   - At least one verified shop with active inventory for an ACTIVE product
+ *   - MongoDB running; server/.env provides MONGO_URI (used to derive the DB name)
+ *   - By default the script spawns its OWN server on port 5016 backed by an
+ *     isolated per-run database and seeds the admin / shop / product itself, so no
+ *     pre-existing dev data is required.
+ *   - Set PH6_TEST_BASE_URL to target an already-running server instead (disables
+ *     the spawn / seed / drop harness).
  *
  * SAFETY / CLEANUP:
  *   - Existing user data is NEVER modified or deleted.
@@ -17,6 +19,8 @@
  *     closed shop + one out-of-stock inventory row, all with per-run unique
  *     identifiers) and deletes exactly those documents in a finally block,
  *     scoped to the captured IDs only.
+ *   - In harness mode ONLY the derived per-run database is dropped and the spawned
+ *     test server is terminated. An external server's database is never dropped.
  *   - If no baseline fixture exists, behavioural checks are SKIPPED (never
  *     failed) and only the validation checks run.
  *
@@ -27,8 +31,14 @@
 const http = require('http');
 const path = require('path');
 const mongoose = require('mongoose');
+const { spawn } = require('child_process');
 
-const BASE = 'http://localhost:5000/api/v1';
+require('dotenv').config({ path: path.join(__dirname, '.env') });
+
+// Base URL of the API under test. Keeps the historical default; the isolation
+// harness below overrides it to a dedicated test port unless PH6_TEST_BASE_URL is
+// supplied to target an already-running server.
+let BASE = process.env.PH6_TEST_BASE_URL || 'http://localhost:5000/api/v1';
 const ADMIN_CREDS = { email: 'admin@findlocal.dev', password: 'Admin@12345' };
 const RUN_SUFFIX = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 
@@ -39,6 +49,180 @@ const created = {
   shopId: null,
   inventoryId: null,
 };
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Isolation harness
+// By default this script runs against its OWN server on a dedicated port backed by
+// a per-run database derived from MONGO_URI, seeds the required admin / verified
+// shop / active product / in-stock inventory there, and drops ONLY that database at
+// the end — it never touches the shared development database. Set PH6_TEST_BASE_URL
+// to target an already-running server instead (this disables spawn / seed / drop).
+// ══════════════════════════════════════════════════════════════════════════════
+
+function deriveTestUri(uri, suffix) {
+  const u = new URL(uri);
+  const baseName = u.pathname.replace(/^\//, '') || 'findlocal';
+  u.pathname = `/${baseName}_ph6test_${suffix}`;
+  return { uri: u.toString(), dbName: u.pathname.slice(1), baseName };
+}
+
+const BASE_DB_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/findlocal';
+const EXTERNAL_BASE = process.env.PH6_TEST_BASE_URL || null;
+const TEST_PORT = Number(process.env.PH6_TEST_PORT || 5016);
+const { uri: TEST_URI, dbName: TEST_DB_NAME, baseName: BASE_DB_NAME } =
+  deriveTestUri(BASE_DB_URI, RUN_SUFFIX);
+
+if (!EXTERNAL_BASE) {
+  BASE = `http://localhost:${TEST_PORT}/api/v1`;
+  // Ensure this script's own DB helpers (fixture discovery / cleanup) target the
+  // isolated database.
+  process.env.MONGO_URI = TEST_URI;
+}
+
+let testServer = null;
+let dbConnected = false;
+
+async function waitForHealth(timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const res = await request('GET', '/health');
+      if (res.status === 200) return true;
+    } catch {
+      /* not up yet */
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return false;
+}
+
+// Seed the admin plus one verified/open shop backed by in-stock active inventory so
+// the behavioural section has a baseline fixture to discover.
+async function seedFixtures() {
+  const User = require('./src/models/User.model');
+  const Shop = require('./src/models/Shop.model');
+  const Product = require('./src/models/Product.model');
+  const Inventory = require('./src/models/Inventory.model');
+  await Promise.all([User.init(), Shop.init(), Product.init(), Inventory.init()]);
+
+  let admin = await User.findOne({ email: ADMIN_CREDS.email });
+  if (!admin) {
+    admin = await User.create({
+      name: 'FindLocal Admin',
+      email: ADMIN_CREDS.email,
+      password: ADMIN_CREDS.password,
+      role: 'admin',
+      isVerified: true,
+      isActive: true,
+    });
+  }
+
+  const seller = await User.create({
+    name: `Phase6 Seed Seller ${RUN_SUFFIX}`,
+    email: `phase6_seed_seller_${RUN_SUFFIX}@test.local`,
+    password: 'Phase6Seed@12345',
+    role: 'seller',
+    isVerified: true,
+    isActive: true,
+  });
+
+  const shop = await Shop.create({
+    owner: seller._id,
+    name: `Phase6 Baseline Shop ${RUN_SUFFIX}`,
+    address: `Phase6 Baseline Address ${RUN_SUFFIX}`,
+    location: { type: 'Point', coordinates: [77.209, 28.6139] },
+    isVerified: true,
+    isOpen: true,
+  });
+
+  const product = await Product.create({
+    name: `Phase6 Baseline Widget ${RUN_SUFFIX}`,
+    brand: 'Phase6Brand',
+    category: 'electronics',
+    status: 'ACTIVE',
+    createdBy: seller._id,
+  });
+
+  await Inventory.create({
+    shop: shop._id,
+    product: product._id,
+    pricePaise: 5000,
+    quantity: 10,
+    isActive: true,
+  });
+}
+
+async function startIsolatedServer() {
+  if (EXTERNAL_BASE) {
+    console.log(`  Using external server at ${EXTERNAL_BASE} (no spawn / no DB drop).`);
+    return;
+  }
+
+  console.log(`  Base database (from .env): ${BASE_DB_NAME}`);
+  console.log(`  Isolated test database:    ${TEST_DB_NAME}`);
+  console.log(`  Dedicated test port:       ${TEST_PORT}`);
+
+  await mongoose.connect(TEST_URI);
+  dbConnected = true;
+  if (mongoose.connection.name !== TEST_DB_NAME) {
+    throw new Error(
+      `Refusing to run: connected to ${mongoose.connection.name}, expected ${TEST_DB_NAME}`
+    );
+  }
+  await seedFixtures();
+  console.log(`  Admin / verified shop / active product / inventory seeded into ${TEST_DB_NAME}.`);
+
+  testServer = spawn(process.execPath, ['server.js'], {
+    cwd: __dirname,
+    env: {
+      ...process.env,
+      MONGO_URI: TEST_URI,
+      PORT: String(TEST_PORT),
+      NODE_ENV: 'test',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  let serverOutput = '';
+  testServer.stdout.on('data', (d) => (serverOutput += d.toString()));
+  testServer.stderr.on('data', (d) => (serverOutput += d.toString()));
+
+  const ready = await waitForHealth();
+  if (!ready) {
+    console.error(serverOutput.trim());
+    throw new Error(`Isolated API server did not become healthy on port ${TEST_PORT}`);
+  }
+  console.log(`  Isolated API server ready on port ${TEST_PORT}.`);
+}
+
+async function stopIsolatedServer() {
+  if (testServer && !testServer.killed) {
+    try {
+      testServer.kill();
+    } catch {
+      /* ignore */
+    }
+  }
+  if (dbConnected) {
+    try {
+      // The script's own cleanup may have disconnected mongoose; reconnect to drop.
+      if (mongoose.connection.readyState === 0) await mongoose.connect(process.env.MONGO_URI);
+      // Never drop a database when targeting an external / shared server.
+      if (!EXTERNAL_BASE) {
+        await mongoose.connection.db.dropDatabase();
+        console.log(`  Dropped isolated test database: ${TEST_DB_NAME}`);
+      }
+    } catch (err) {
+      console.error(`  Cleanup failed: ${err.message}`);
+    }
+    try {
+      await mongoose.disconnect();
+    } catch {
+      /* ignore */
+    }
+    dbConnected = false;
+  }
+}
 
 let passed = 0;
 let failed = 0;
@@ -475,18 +659,18 @@ async function testBehaviour(fixture) {
 async function main() {
   console.log('\n=== FindLocal Phase 6 Search Filter Tests ===');
 
-  let connected = false;
-
   try {
-    await loginAsAdmin();
+    await startIsolatedServer();
 
-    require('dotenv').config({ path: path.join(__dirname, '.env') });
-    if (!process.env.MONGO_URI) {
-      throw new Error('MONGO_URI missing; cannot discover fixtures or clean up.');
+    if (mongoose.connection.readyState === 0) {
+      if (!process.env.MONGO_URI) {
+        throw new Error('MONGO_URI missing; cannot discover fixtures or clean up.');
+      }
+      await mongoose.connect(process.env.MONGO_URI);
+      dbConnected = true;
     }
 
-    await mongoose.connect(process.env.MONGO_URI);
-    connected = true;
+    await loginAsAdmin();
 
     const fixture = await findBaselineFixture();
 
@@ -506,16 +690,11 @@ async function main() {
     failed++;
     failures.push(`unexpected: ${err.message}`);
   } finally {
-    if (connected && (created.userId || created.shopId || created.inventoryId)) {
+    if (dbConnected && (created.userId || created.shopId || created.inventoryId)) {
       await cleanupIsolatedFixture();
     }
-    if (connected) {
-      try {
-        await mongoose.disconnect();
-      } catch (err) {
-        console.error('MongoDB disconnect error:', err.message);
-      }
-    }
+    // Terminate the dedicated test server and drop ONLY the isolated database.
+    await stopIsolatedServer();
   }
 
   console.log('\n========================================');

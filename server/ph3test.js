@@ -14,8 +14,16 @@
  */
 
 const http = require('http');
+const path = require('path');
+const { spawn } = require('child_process');
+const mongoose = require('mongoose');
 
-const BASE = 'http://localhost:5000/api/v1';
+require('dotenv').config({ path: path.join(__dirname, '.env') });
+
+// Base URL of the API under test. Keeps the historical default; the isolation
+// harness below overrides it to a dedicated test port unless PH3_TEST_BASE_URL is
+// supplied to target an already-running server.
+let BASE = process.env.PH3_TEST_BASE_URL || 'http://localhost:5000/api/v1';
 
 // ─── Credentials (ensure these exist in your DB) ────────────────────────────
 const ADMIN_CREDS = { email: 'admin@findlocal.dev', password: 'Admin@12345' };
@@ -34,6 +42,131 @@ const RUN_SUFFIX = `T${Date.now().toString(36)}${Math.random().toString(36).slic
 // 13-digit GTIN unique to this run (validator only enforces digits + length).
 const RUN_GTIN = (Date.now().toString().slice(-10) +
   Math.floor(Math.random() * 1000).toString().padStart(3, '0'));
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Isolation harness
+// By default this script runs against its OWN server on a dedicated port backed by
+// a per-run database derived from MONGO_URI, seeds the admin there, and drops ONLY
+// that database at the end — it never touches the shared development database.
+// Set PH3_TEST_BASE_URL to target an already-running server instead (this disables
+// the spawn / seed / drop harness entirely).
+// ══════════════════════════════════════════════════════════════════════════════
+function deriveTestUri(uri, suffix) {
+  const u = new URL(uri);
+  const baseName = u.pathname.replace(/^\//, '') || 'findlocal';
+  u.pathname = `/${baseName}_ph3test_${suffix}`;
+  return { uri: u.toString(), dbName: u.pathname.slice(1), baseName };
+}
+
+const BASE_DB_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/findlocal';
+const EXTERNAL_BASE = process.env.PH3_TEST_BASE_URL || null;
+const TEST_PORT = Number(process.env.PH3_TEST_PORT || 5013);
+const { uri: TEST_URI, dbName: TEST_DB_NAME, baseName: BASE_DB_NAME } =
+  deriveTestUri(BASE_DB_URI, RUN_SUFFIX);
+
+if (!EXTERNAL_BASE) {
+  BASE = `http://localhost:${TEST_PORT}/api/v1`;
+}
+
+let testServer = null;
+let dbConnected = false;
+
+async function waitForHealth(timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const res = await request('GET', '/health');
+      if (res.status === 200) return true;
+    } catch {
+      /* not up yet */
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return false;
+}
+
+// Admins cannot self-register, so seed one directly into the isolated database.
+async function seedAdmin() {
+  const User = require('./src/models/User.model');
+  await User.init();
+  const existing = await User.findOne({ email: ADMIN_CREDS.email });
+  if (existing) return;
+  await User.create({
+    name: 'Admin',
+    email: ADMIN_CREDS.email,
+    password: ADMIN_CREDS.password,
+    role: 'admin',
+    isVerified: true,
+    isActive: true,
+  });
+}
+
+async function startIsolatedServer() {
+  if (EXTERNAL_BASE) {
+    console.log(`  Using external server at ${EXTERNAL_BASE} (no spawn / no DB drop).`);
+    return;
+  }
+
+  console.log(`  Base database (from .env): ${BASE_DB_NAME}`);
+  console.log(`  Isolated test database:    ${TEST_DB_NAME}`);
+  console.log(`  Dedicated test port:       ${TEST_PORT}`);
+
+  await mongoose.connect(TEST_URI);
+  dbConnected = true;
+  if (mongoose.connection.name !== TEST_DB_NAME) {
+    throw new Error(
+      `Refusing to run: connected to ${mongoose.connection.name}, expected ${TEST_DB_NAME}`
+    );
+  }
+  await seedAdmin();
+  console.log(`  Admin seeded into ${TEST_DB_NAME}.`);
+
+  testServer = spawn(process.execPath, ['server.js'], {
+    cwd: __dirname,
+    env: {
+      ...process.env,
+      MONGO_URI: TEST_URI,
+      PORT: String(TEST_PORT),
+      NODE_ENV: 'test',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  let serverOutput = '';
+  testServer.stdout.on('data', (d) => (serverOutput += d.toString()));
+  testServer.stderr.on('data', (d) => (serverOutput += d.toString()));
+
+  const ready = await waitForHealth();
+  if (!ready) {
+    console.error(serverOutput.trim());
+    throw new Error(`Isolated API server did not become healthy on port ${TEST_PORT}`);
+  }
+  console.log(`  Isolated API server ready on port ${TEST_PORT}.`);
+}
+
+async function stopIsolatedServer() {
+  if (testServer && !testServer.killed) {
+    try {
+      testServer.kill();
+    } catch {
+      /* ignore */
+    }
+  }
+  if (dbConnected) {
+    try {
+      await mongoose.connection.db.dropDatabase();
+      console.log(`  Dropped isolated test database: ${TEST_DB_NAME}`);
+    } catch (err) {
+      console.error(`  Cleanup failed: ${err.message}`);
+    }
+    try {
+      await mongoose.disconnect();
+    } catch {
+      /* ignore */
+    }
+    dbConnected = false;
+  }
+}
 
 let passed = 0;
 let failed = 0;
@@ -138,7 +271,7 @@ async function setup() {
   } else {
     console.log('  ❌ Admin login failed — aborting tests');
     console.log('     Response:', JSON.stringify(adminRes.body));
-    process.exit(1);
+    throw new Error('Admin login failed');
   }
 
   // Login seller1
@@ -148,7 +281,7 @@ async function setup() {
     console.log('  ✅ Seller1 logged in');
   } else {
     console.log('  ❌ Seller1 login failed — aborting tests');
-    process.exit(1);
+    throw new Error('Seller1 login failed');
   }
 
   // Login seller2
@@ -158,7 +291,7 @@ async function setup() {
     console.log('  ✅ Seller2 logged in');
   } else {
     console.log('  ❌ Seller2 login failed — aborting tests');
-    process.exit(1);
+    throw new Error('Seller2 login failed');
   }
 
   // Login customer
@@ -168,7 +301,7 @@ async function setup() {
     console.log('  ✅ Customer logged in');
   } else {
     console.log('  ❌ Customer login failed — aborting tests');
-    process.exit(1);
+    throw new Error('Customer login failed');
   }
 }
 
@@ -758,6 +891,7 @@ async function testNormalization() {
 // ══════════════════════════════════════════════════════════════════════════════
 async function runTests() {
   try {
+    await startIsolatedServer();
     await setup();
     await testCreation();
     await testValidation();
@@ -784,6 +918,8 @@ async function runTests() {
     console.error('Test runner error:', err);
   } finally {
     await cleanup();
+    // Terminate the dedicated test server and drop ONLY the isolated database.
+    await stopIsolatedServer();
   }
 }
 
