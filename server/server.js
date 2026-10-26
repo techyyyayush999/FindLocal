@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
+const helmet = require('helmet');
 const { assertValidEnv } = require('./src/config/env');
 const connectDB = require('./src/config/db');
 const healthRoutes = require('./src/routes/health.routes');
@@ -13,6 +14,11 @@ const inventoryRoutes = require('./src/routes/inventory.routes');
 const reservationRoutes = require('./src/routes/reservation.routes');
 const { createExpirySweeper } = require('./src/services/reservation.service');
 const { notFound, errorHandler } = require('./src/middlewares/errorHandler');
+const {
+  apiLimiter,
+  authLimiter,
+  reservationCreationLimiter,
+} = require('./src/middlewares/rateLimit.middleware');
 
 // ─── Validate configuration before anything else ───────────────────────────────
 // A misconfigured server must fail fast — before it connects to the database or
@@ -34,6 +40,10 @@ connectDB();
 // Initialize Express app
 const app = express();
 
+// Security headers (Helmet) and remove the framework fingerprint header.
+app.disable('x-powered-by');
+app.use(helmet());
+
 // Enable CORS — credentials:true is required for HttpOnly cookies to be sent cross-origin.
 // The allowlist comes from the validated config: a wildcard is rejected at startup,
 // so there is no silent "*" fallback while credentials are enabled.
@@ -44,9 +54,25 @@ app.use(
   })
 );
 
-// Body parser middlewares
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Rate limiting — mounted before the body parsers so rejected bursts stay cheap,
+// and after CORS so a 429 response still carries the CORS headers the browser needs
+// to read it. Limits come from the validated config (see src/config/env.js).
+app.use('/api/v1', apiLimiter); // broad ceiling for all API traffic
+app.use('/api/v1/auth/login', authLimiter); // strict — credential guessing
+app.use('/api/v1/auth/register', authLimiter);
+app.use('/api/v1/reservations', (req, res, next) => {
+  // Targeted limiter: only reservation creation is counted here, so reads,
+  // cancellations and pickups are left to the broad API limiter.
+  const path = (req.originalUrl || '').split('?')[0];
+  if (req.method === 'POST' && path === '/api/v1/reservations') {
+    return reservationCreationLimiter(req, res, next);
+  }
+  next();
+});
+
+// Body parser middlewares — explicit size limit to bound per-request memory.
+app.use(express.json({ limit: '100kb' }));
+app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 
 // Cookie parser — required for req.cookies to be populated (used by protect middleware)
 app.use(cookieParser());

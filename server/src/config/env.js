@@ -138,10 +138,35 @@ function validateEnv(env = process.env) {
   const nodeEnv = String(env.NODE_ENV || 'development').trim() || 'development';
   const jwtExpiresIn = String(env.JWT_EXPIRES_IN || '7d').trim() || '7d';
 
+  // ── Rate limiting (optional) ────────────────────────────────────────────────
+  // Positive integers only. Defaults stay conservative in production but are
+  // deliberately generous under NODE_ENV=test, so the isolated regression suites
+  // (which issue many requests from a single host) are never throttled. An
+  // explicitly provided value always wins over the default, which lets the
+  // security tests force an HTTP 429 on purpose.
+  const isTest = nodeEnv === 'test';
+  const readPositiveInt = (name, fallback) => {
+    const raw = env[name];
+    if (raw === undefined || String(raw).trim() === '') return fallback;
+    const parsed = Number(raw);
+    if (!Number.isInteger(parsed) || parsed <= 0) {
+      errors.push(`${name} must be a positive integer.`);
+      return fallback;
+    }
+    return parsed;
+  };
+
+  const rateLimit = {
+    windowMs: readPositiveInt('RATE_LIMIT_WINDOW_MS', 15 * 60 * 1000),
+    apiMax: readPositiveInt('RATE_LIMIT_API_MAX', isTest ? 1000000 : 300),
+    authMax: readPositiveInt('RATE_LIMIT_AUTH_MAX', isTest ? 1000000 : 10),
+    reservationMax: readPositiveInt('RATE_LIMIT_RESERVATION_MAX', isTest ? 1000000 : 20),
+  };
+
   return {
     ok: errors.length === 0,
     errors,
-    config: { mongoUri, jwtSecret, corsOrigins, port, nodeEnv, jwtExpiresIn },
+    config: { mongoUri, jwtSecret, corsOrigins, port, nodeEnv, jwtExpiresIn, rateLimit },
   };
 }
 
