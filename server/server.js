@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
-const dotenv = require('dotenv');
 const cookieParser = require('cookie-parser');
+const { assertValidEnv } = require('./src/config/env');
 const connectDB = require('./src/config/db');
 const healthRoutes = require('./src/routes/health.routes');
 const authRoutes = require('./src/routes/auth.routes');
@@ -14,8 +14,19 @@ const reservationRoutes = require('./src/routes/reservation.routes');
 const { createExpirySweeper } = require('./src/services/reservation.service');
 const { notFound, errorHandler } = require('./src/middlewares/errorHandler');
 
-// Load environment variables
-dotenv.config();
+// ─── Validate configuration before anything else ───────────────────────────────
+// A misconfigured server must fail fast — before it connects to the database or
+// accepts any request — so a missing/placeholder JWT secret or a wildcard CORS
+// origin can never go live. validateEnv only ever reports variable names and
+// reasons, never secret values.
+let envConfig;
+try {
+  envConfig = assertValidEnv();
+} catch (error) {
+  console.error(error.message);
+  console.error('Server startup aborted due to invalid configuration.');
+  process.exit(1);
+}
 
 // Connect to MongoDB
 connectDB();
@@ -23,10 +34,12 @@ connectDB();
 // Initialize Express app
 const app = express();
 
-// Enable CORS — credentials:true is required for HttpOnly cookies to be sent cross-origin
+// Enable CORS — credentials:true is required for HttpOnly cookies to be sent cross-origin.
+// The allowlist comes from the validated config: a wildcard is rejected at startup,
+// so there is no silent "*" fallback while credentials are enabled.
 app.use(
   cors({
-    origin: process.env.CORS_ORIGIN || '*',
+    origin: envConfig.corsOrigins,
     credentials: true,
   })
 );
@@ -53,7 +66,7 @@ app.use(notFound);
 app.use(errorHandler);
 
 // Server listener
-const PORT = process.env.PORT || 5000;
+const PORT = envConfig.port;
 
 // Background reservation expiry sweep (F1): releases held stock exactly once and
 // closes expired reservations as EXPIRED via the idempotent settlement path. It is
