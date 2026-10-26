@@ -5,6 +5,7 @@ const {
   PRODUCT_SYSTEM_FIELDS,
   VALID_GTIN_LENGTHS,
 } = require('../constants/productConstants');
+const { INVENTORY_BOUNDS } = require('../constants/inventoryConstants');
 
 // ─── Helper: reject system/unknown fields in body ────────────────────────────
 // Returns a custom body() validator that ensures no system-generated or
@@ -278,6 +279,72 @@ const productSearchRules = [
     .optional()
     .isIn(['distance', 'price'])
     .withMessage('Sort must be distance or price'),
+
+  // ─── Optional Phase 6 filters ──────────────────────────────────────────────
+  // brand: case-insensitive substring match (escaped in the controller)
+  sanitizeQueryString('brand'),
+  query('brand')
+    .optional()
+    .isString()
+    .withMessage('Brand must be a string')
+    .trim()
+    .isLength({ min: 1, max: 80 })
+    .withMessage('Brand must be between 1 and 80 characters'),
+
+  // category: must be one of the known PRODUCT_CATEGORIES
+  sanitizeQueryString('category'),
+  query('category')
+    .optional()
+    .isIn(PRODUCT_CATEGORIES)
+    .withMessage(`Category must be one of: ${PRODUCT_CATEGORIES.join(', ')}`),
+
+  // minPrice / maxPrice: inclusive range over inventory.pricePaise
+  query('minPrice')
+    .optional()
+    .isInt({
+      min: INVENTORY_BOUNDS.PRICE_MIN,
+      max: INVENTORY_BOUNDS.PRICE_MAX,
+    })
+    .withMessage(
+      `minPrice must be an integer between ${INVENTORY_BOUNDS.PRICE_MIN} and ${INVENTORY_BOUNDS.PRICE_MAX}`
+    )
+    .toInt(),
+
+  query('maxPrice')
+    .optional()
+    .isInt({
+      min: INVENTORY_BOUNDS.PRICE_MIN,
+      max: INVENTORY_BOUNDS.PRICE_MAX,
+    })
+    .withMessage(
+      `maxPrice must be an integer between ${INVENTORY_BOUNDS.PRICE_MIN} and ${INVENTORY_BOUNDS.PRICE_MAX}`
+    )
+    .toInt(),
+
+  // Reject inverted ranges when both bounds are supplied
+  query('minPrice')
+    .optional()
+    .custom((value, { req }) => {
+      const min = req.query.minPrice;
+      const max = req.query.maxPrice;
+      if (min !== undefined && max !== undefined && Number(min) > Number(max)) {
+        throw new Error('minPrice cannot be greater than maxPrice');
+      }
+      return true;
+    }),
+
+  // inStock / openNow: strict boolean strings
+  sanitizeQueryString('inStock'),
+  query('inStock')
+    .optional()
+    .isIn(['true', 'false'])
+    .withMessage('inStock must be either true or false'),
+
+  sanitizeQueryString('openNow'),
+  query('openNow')
+    .optional()
+    .isIn(['true', 'false'])
+    .withMessage('openNow must be either true or false'),
 
   ...paginationRules,
 ];

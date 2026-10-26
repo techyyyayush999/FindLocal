@@ -459,7 +459,29 @@ const searchProducts = asyncHandler(async (req, res) => {
   const sortBy = req.query.sort === 'price' ? 'price' : 'distance';
 
   // Escape regex metacharacters so user input is treated as plain text.
-  const escapedQuery = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const escapedQuery = escapeRegex(q);
+
+  // ─── Optional Phase 6 filters ──────────────────────────────────────────────
+  // All values are already validated/normalized by productSearchRules.
+  const brand = typeof req.query.brand === 'string' ? req.query.brand.trim() : '';
+  const category =
+    typeof req.query.category === 'string' ? req.query.category : '';
+
+  const hasMinPrice = req.query.minPrice !== undefined;
+  const hasMaxPrice = req.query.maxPrice !== undefined;
+  const minPrice = hasMinPrice ? Number(req.query.minPrice) : undefined;
+  const maxPrice = hasMaxPrice ? Number(req.query.maxPrice) : undefined;
+
+  // Boolean-string filters. Omitted (or false) preserves Phase 5 behaviour:
+  // out-of-stock results and closed shops are included by default.
+  const inStockOnly = req.query.inStock === 'true';
+  const openNowOnly = req.query.openNow === 'true';
+
+  // openNow only depends on the shop document, so it can be applied as early
+  // as the $geoNear query (which must remain the first stage).
+  const geoNearQuery = { isVerified: true };
+  if (openNowOnly) geoNearQuery.isOpen = true;
 
   const pipeline = [
     {
@@ -471,7 +493,7 @@ const searchProducts = asyncHandler(async (req, res) => {
         distanceField: 'distanceMeters',
         maxDistance: radius,
         spherical: true,
-        query: { isVerified: true },
+        query: geoNearQuery,
       },
     },
     {
@@ -483,11 +505,20 @@ const searchProducts = asyncHandler(async (req, res) => {
       },
     },
     { $unwind: '$inventory' },
-    {
-      $match: {
-        'inventory.isActive': true,
-      },
-    },
+  ];
+
+  // Price filters only need inventory.pricePaise, so they run before the
+  // product $lookup. Combine them with the isActive check in one $match.
+  const inventoryMatch = { 'inventory.isActive': true };
+  if (hasMinPrice || hasMaxPrice) {
+    const priceRange = {};
+    if (hasMinPrice) priceRange.$gte = minPrice;
+    if (hasMaxPrice) priceRange.$lte = maxPrice;
+    inventoryMatch['inventory.pricePaise'] = priceRange;
+  }
+  pipeline.push({ $match: inventoryMatch });
+
+  pipeline.push(
     {
       $lookup: {
         from: Product.collection.name,
@@ -496,25 +527,42 @@ const searchProducts = asyncHandler(async (req, res) => {
         as: 'product',
       },
     },
-    { $unwind: '$product' },
-    {
-      $match: {
-        'product.status': PRODUCT_STATUSES.ACTIVE,
-        'product.name': { $regex: escapedQuery, $options: 'i' },
+    { $unwind: '$product' }
+  );
+
+  // Product-level filters: status, name, brand, category.
+  const productMatch = {
+    'product.status': PRODUCT_STATUSES.ACTIVE,
+    'product.name': { $regex: escapedQuery, $options: 'i' },
+  };
+  if (brand) {
+    productMatch['product.brand'] = { $regex: escapeRegex(brand), $options: 'i' };
+  }
+  if (category) {
+    productMatch['product.category'] = category;
+  }
+  pipeline.push({ $match: productMatch });
+
+  pipeline.push({
+    $addFields: {
+      availableQuantity: {
+        $subtract: [
+          '$inventory.quantity',
+          { $ifNull: ['$inventory.reservedQuantity', 0] },
+        ],
       },
+      price: { $divide: ['$inventory.pricePaise', 100] },
+      distanceKm: { $divide: ['$distanceMeters', 1000] },
     },
-    {
-      $addFields: {
-        availableQuantity: {
-          $subtract: [
-            '$inventory.quantity',
-            { $ifNull: ['$inventory.reservedQuantity', 0] },
-          ],
-        },
-        price: { $divide: ['$inventory.pricePaise', 100] },
-        distanceKm: { $divide: ['$distanceMeters', 1000] },
-      },
-    },
+  });
+
+  // inStock=true excludes results with availableQuantity <= 0. When omitted
+  // or false, out-of-stock results remain visible (Phase 5 behaviour).
+  if (inStockOnly) {
+    pipeline.push({ $match: { availableQuantity: { $gt: 0 } } });
+  }
+
+  pipeline.push(
     {
       $addFields: {
         stockStatus: {
@@ -560,8 +608,8 @@ const searchProducts = asyncHandler(async (req, res) => {
         metadata: [{ $count: 'total' }],
         results: [{ $skip: skip }, { $limit: limit }],
       },
-    },
-  ];
+    }
+  );
 
   const [output] = await Shop.aggregate(pipeline);
   const results = output?.results || [];
