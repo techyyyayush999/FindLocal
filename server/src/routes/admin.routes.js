@@ -11,9 +11,12 @@ const router = express.Router();
 router.use(protect, authorize('admin'));
 
 // ─── User management ──────────────────────────────────────────────────────────
+// The ':id' routes validate the param up front with the same shared rule used by
+// the shop routes below, so a malformed ObjectId is rejected as a consistent
+// client error and never reaches a Mongoose query.
 router.get('/users', getAllUsers);
-router.get('/users/:id', getUserById);
-router.patch('/users/:id/status', updateUserStatus);
+router.get('/users/:id', objectIdParamRules, getUserById);
+router.patch('/users/:id/status', objectIdParamRules, updateUserStatus);
 
 // ─── Shop management ──────────────────────────────────────────────────────────
 router.get('/shops', adminGetAllShops);

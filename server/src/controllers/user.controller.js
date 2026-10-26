@@ -41,8 +41,10 @@ const updateUserStatus = asyncHandler(async (req, res) => {
     throw error;
   }
 
-  // Prevent self-deactivation
-  if (req.params.id === req.user._id.toString()) {
+  // Prevent self-deactivation. Compare as ObjectIds, not as raw strings: a hex
+  // ObjectId is case-insensitive, so a differently-cased (but equivalent) id
+  // must not be able to slip past this guard and deactivate the admin.
+  if (req.user._id.equals(req.params.id)) {
     const error = new Error('Admins cannot change their own active status.');
     error.statusCode = 400;
     throw error;
