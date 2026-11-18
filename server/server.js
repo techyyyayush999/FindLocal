@@ -1,3 +1,5 @@
+const path = require('path');
+const fs = require('fs');
 const express = require('express');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
@@ -6,6 +8,7 @@ const mongoose = require('mongoose');
 const { assertValidEnv } = require('./src/config/env');
 const connectDB = require('./src/config/db');
 const { createGracefulShutdown } = require('./src/utils/gracefulShutdown');
+const logger = require('./src/utils/logger');
 const healthRoutes = require('./src/routes/health.routes');
 const authRoutes = require('./src/routes/auth.routes');
 const adminRoutes = require('./src/routes/admin.routes');
@@ -16,6 +19,7 @@ const inventoryRoutes = require('./src/routes/inventory.routes');
 const reservationRoutes = require('./src/routes/reservation.routes');
 const { createExpirySweeper } = require('./src/services/reservation.service');
 const { notFound, errorHandler } = require('./src/middlewares/errorHandler');
+const requestLogger = require('./src/middlewares/requestLogger');
 const {
   apiLimiter,
   authLimiter,
@@ -36,12 +40,43 @@ try {
   process.exit(1);
 }
 
+// ─── Process-level fatal-error handlers ────────────────────────────────────────
+// Registered once, after configuration validation. They log safe diagnostic
+// information only (message + stack — never request bodies, headers, cookies,
+// authorization headers, passwords, JWTs or database credentials) and reuse the
+// graceful shutdown routine so sockets and the DB connection are drained before
+// exit. `shutdown` is assigned once the HTTP server is listening (see
+// startServer); a fatal error before that has nothing to drain, so it exits 1
+// directly.
+let shutdown = null;
+
+process.on('uncaughtException', (err) => {
+  logger.error('uncaught_exception', {
+    error: err && err.message ? err.message : String(err),
+    stack: err && err.stack,
+  });
+  if (shutdown) shutdown('uncaughtException', 1);
+  else process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+  const message = reason && reason.message ? reason.message : String(reason);
+  logger.error('unhandled_rejection', { error: message });
+  if (shutdown) shutdown('unhandledRejection', 1);
+  else process.exit(1);
+});
+
 // Initialize Express app
 const app = express();
 
 // Security headers (Helmet) and remove the framework fingerprint header.
 app.disable('x-powered-by');
 app.use(helmet());
+
+// Request logging — mounted immediately after Helmet and before CORS and all
+// rate limiters, so CORS preflight and rate-limited requests are captured too.
+// Sets req.id (server-generated), which errorHandler reads for correlation.
+app.use(requestLogger);
 
 // Enable CORS — credentials:true is required for HttpOnly cookies to be sent cross-origin.
 // The allowlist comes from the validated config: a wildcard is rejected at startup,
@@ -86,6 +121,26 @@ app.use('/api/v1/products', productRoutes);     // Products: authenticated, role
 app.use('/api/v1/inventory', inventoryRoutes);  // Inventory: seller, shop-scoped
 app.use('/api/v1/reservations', reservationRoutes); // Reservations: customer create/read, seller read
 
+// ─── Static hosting: React production build + SPA fallback ─────────────────────
+// Serve the Vite build output so a single domain hosts both the SPA and the API.
+// Deep links (/login, /reservations, /seller, …) are answered with index.html so
+// the client-side BrowserRouter can resolve them.
+const CLIENT_DIST = path.join(__dirname, '..', 'client', 'dist');
+const INDEX_FILE = path.join(CLIENT_DIST, 'index.html');
+
+app.use(express.static(CLIENT_DIST));
+
+// GET-only SPA fallback. It never intercepts the API (or any non-GET request), so
+// unknown /api/* paths still reach notFound and keep the JSON 404 contract. When
+// the build is absent it falls through instead of raising an ENOENT/500.
+app.get('*', (req, res, next) => {
+  if (req.path === '/api' || req.path.startsWith('/api/')) return next();
+  if (!fs.existsSync(INDEX_FILE)) return next();
+  res.sendFile(INDEX_FILE, (err) => {
+    if (err) next(err);
+  });
+});
+
 // 404 & Centralized Error Handlers
 app.use(notFound);
 app.use(errorHandler);
@@ -114,12 +169,14 @@ async function startServer() {
     expirySweeper.start();
   });
 
-  const { shutdown } = createGracefulShutdown({
+  const graceful = createGracefulShutdown({
     server,
     connection: mongoose.connection,
     sweeper: expirySweeper,
+    logger,
     timeoutMs: Number(process.env.SHUTDOWN_TIMEOUT_MS || 10000),
   });
+  shutdown = graceful.shutdown; // expose to the process-level handlers above
 
   // Idempotent: repeated signals are ignored by the shutdown routine itself.
   process.on('SIGINT', () => shutdown('SIGINT'));

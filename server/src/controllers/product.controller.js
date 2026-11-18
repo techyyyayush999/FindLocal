@@ -577,6 +577,12 @@ const searchProducts = asyncHandler(async (req, res) => {
     {
       $project: {
         _id: 0,
+        // Actual Inventory document _id, required so an authenticated customer can
+        // create a reservation from a search result. Only the identifier is
+        // exposed — internal stock-hold fields stay hidden.
+        inventory: {
+          _id: '$inventory._id',
+        },
         product: {
           _id: '$product._id',
           name: '$product.name',

@@ -11,6 +11,10 @@
  * The routine is pure with respect to process state (the exit function is
  * injected), which keeps it unit-testable without real OS signals.
  *
+ * The exit code defaults to 0 (graceful signal). A fatal error passes 1, and
+ * that code is sticky: a later call may only upgrade it, never downgrade it,
+ * while cleanup still runs exactly once.
+ *
  * Returns { shutdown, isShuttingDown }.
  */
 function createGracefulShutdown({
@@ -22,6 +26,9 @@ function createGracefulShutdown({
   exit = process.exit,
 } = {}) {
   let shuttingDown = false;
+  // Sticky exit code: starts at 0 (graceful) and can only be upgraded to 1 by a
+  // fatal-error call, never downgraded by a later signal.
+  let pendingExitCode = 0;
 
   // server.close() stops accepting new connections and invokes the callback only
   // once every in-flight request has finished — the desired "drain" behaviour.
@@ -38,7 +45,15 @@ function createGracefulShutdown({
     return Promise.resolve(connection.close(false));
   };
 
-  async function shutdown(signal) {
+  async function shutdown(signal, exitCode = 0) {
+    // A fatal error (exitCode 1) must win even if it arrives while a normal
+    // shutdown is already draining: upgrade the pending exit code first, then
+    // let the single in-flight cleanup finish. A code-0 call can never downgrade
+    // an already-upgraded (fatal) exit code.
+    if (exitCode > pendingExitCode) {
+      pendingExitCode = exitCode;
+    }
+
     if (shuttingDown) {
       logger.log(`[shutdown] already in progress; ignoring ${signal || 'signal'}.`);
       return { alreadyShuttingDown: true };
@@ -60,7 +75,7 @@ function createGracefulShutdown({
       await closeConnection();
       clearTimeout(forceTimer);
       logger.log('[shutdown] graceful shutdown complete.');
-      exit(0);
+      exit(pendingExitCode);
       return { ok: true };
     } catch (error) {
       clearTimeout(forceTimer);

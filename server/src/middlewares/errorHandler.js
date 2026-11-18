@@ -1,3 +1,5 @@
+const logger = require('../utils/logger');
+
 const notFound = (req, res, next) => {
   const error = new Error(`Not Found - ${req.originalUrl}`);
   res.status(404);
@@ -45,6 +47,20 @@ const errorHandler = (err, req, res, next) => {
   // Prefer an explicit statusCode; otherwise honour a status already set on the
   // response (e.g. 404 from notFound); never fall back to the default 200.
   const statusCode = err.statusCode || (res.statusCode >= 400 ? res.statusCode : 500);
+
+  // Structured log for unexpected server errors. Only safe, explicitly-selected
+  // fields are recorded — never request bodies, headers, cookies or credentials.
+  // The response contract below is unchanged.
+  if (statusCode >= 500) {
+    logger.error('unhandled_request_error', {
+      requestId: req.id, // omitted by the logger when undefined (no request-id middleware yet)
+      method: req.method,
+      path: (req.originalUrl || '').split('?')[0],
+      status: statusCode,
+      error: err.message,
+      stack: err.stack,
+    });
+  }
 
   // Never leak raw server-side errors/stack traces in production responses.
   const isProduction = process.env.NODE_ENV === 'production';

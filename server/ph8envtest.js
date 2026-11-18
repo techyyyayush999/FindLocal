@@ -24,6 +24,7 @@ const http = require('http');
 const path = require('path');
 const { spawn } = require('child_process');
 const mongoose = require('mongoose');
+const { MongoClient } = mongoose.mongo;
 
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
@@ -39,6 +40,120 @@ function deriveTestUri(uri, suffix) {
 
 const BASE_DB_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/findlocal';
 const { uri: TEST_URI, dbName: TEST_DB_NAME } = deriveTestUri(BASE_DB_URI, RUN_SUFFIX);
+
+// ─── Remote database safety gate ──────────────────────────────────────────────
+// Only the host is ever surfaced — never credentials and never the full URI.
+function uriHost(uri) {
+  try {
+    return new URL(uri).host || '(unknown)';
+  } catch {
+    return '(unparseable)';
+  }
+}
+
+function hostIsRemote(host) {
+  return !/^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(host);
+}
+
+const BASE_HOST = uriHost(BASE_DB_URI);
+
+// Running against a remote cluster (e.g. Atlas) is opt-in: it must never happen
+// by accident, because it writes test fixtures to a shared/production cluster.
+function assertRemoteAllowed() {
+  if (hostIsRemote(BASE_HOST) && process.env.PH8ENV_ALLOW_REMOTE !== '1') {
+    throw new Error(
+      `Refusing to run: MONGO_URI host "${BASE_HOST}" is not local. ` +
+        'Set PH8ENV_ALLOW_REMOTE=1 to explicitly allow a remote database.'
+    );
+  }
+}
+
+// ─── Guarded cleanup: drop ONLY this run's isolated database (native driver) ───
+// Extract the database name embedded in a connection URI so the guarded name can
+// be cross-checked against the URI actually targeted. No credentials and no full
+// URI are ever surfaced.
+function uriDbName(uri) {
+  try {
+    return decodeURIComponent(new URL(uri).pathname.replace(/^\//, ''));
+  } catch {
+    return '';
+  }
+}
+
+// Exact-equality guard: a name is safe iff it is literally this run's isolated
+// database. Substring / prefix matching is intentionally avoided.
+function assertSafeDbName(name) {
+  if (name !== TEST_DB_NAME) {
+    throw new Error(
+      `Refusing to operate on database "${name}" — not this run's isolated database.`
+    );
+  }
+}
+
+// `listDatabases` requires a cluster privilege. If the account lacks it the drop
+// may still have succeeded, so absence verification becomes INCONCLUSIVE — never
+// a confirmed absence, and never a silently-passed cleanup.
+function isListPrivilegeError(err) {
+  if (!err) return false;
+  if (err.code === 13 || err.codeName === 'Unauthorized') return true;
+  return /not authorized|unauthorized|requires authentication/i.test(
+    String(err.message || '')
+  );
+}
+
+// Drop ONLY the isolated database with the NATIVE driver, then verify absence.
+// Returns { dropped: true, verified: true } on verified absence, or
+// { dropped: true, verified: false, inconclusive: true } when the drop was issued
+// but a listDatabases privilege limitation prevented verification. Throws on a
+// guard failure or an actual drop failure.
+async function dropIsolatedTestDb() {
+  // Guard first — never touch a database outside this run.
+  assertSafeDbName(TEST_DB_NAME);
+  // The URI must point at exactly the guarded database, not merely a name that
+  // happens to be accepted by the guard.
+  const uriName = uriDbName(TEST_URI);
+  if (uriName !== TEST_DB_NAME) {
+    throw new Error(
+      `Refusing to drop: URI target "${uriName}" does not match guarded "${TEST_DB_NAME}".`
+    );
+  }
+
+  // Drop with the NATIVE driver, NOT Mongoose: a Mongoose connection triggers
+  // auto-index building for registered models, which can recreate the database
+  // immediately after the drop. The native client registers no models.
+  const client = new MongoClient(TEST_URI, { serverSelectionTimeoutMS: 5000 });
+  try {
+    await client.connect();
+    await client.db(TEST_DB_NAME).dropDatabase();
+
+    // A resolved dropDatabase() is NOT proof of deletion. Re-list and confirm the
+    // exact name is gone; a listing-privilege failure yields INCONCLUSIVE.
+    try {
+      const { databases } = await client.db().admin().listDatabases();
+      if (databases.some((d) => d.name === TEST_DB_NAME)) {
+        throw new Error(`database "${TEST_DB_NAME}" still exists after dropDatabase()`);
+      }
+      console.log(`  Cleanup: dropped and verified absent ${TEST_DB_NAME}`);
+      return { dropped: true, verified: true };
+    } catch (verifyErr) {
+      if (isListPrivilegeError(verifyErr)) {
+        console.error(
+          `  Cleanup: dropped ${TEST_DB_NAME}, but absence could not be verified (account lacks listDatabases privilege).`
+        );
+        return { dropped: true, verified: false, inconclusive: true, reason: 'LIST_PRIVILEGE' };
+      }
+      throw verifyErr;
+    }
+  } finally {
+    // Always close the cleanup connection, in every path.
+    try {
+      await client.close();
+    } catch {
+      /* already closed */
+    }
+  }
+}
+
 const TEST_PORT = Number(process.env.PH8_TEST_PORT || 5018);
 const CORS_TEST_ORIGIN = 'http://localhost:5198';
 
@@ -117,6 +232,67 @@ function killServer(child) {
   } catch {
     /* already gone */
   }
+}
+
+// ─── Bounded child-process shutdown ───────────────────────────────────────────
+// Resolve once the child is confirmed exited, or after timeoutMs. Also resolves
+// immediately when the child has already exited, closing the listener race.
+// Listeners and the timer are always cleaned up so nothing lingers on the loop.
+function awaitChildExit(child, timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.removeListener('exit', onExit);
+      child.removeListener('error', onError);
+      resolve(result);
+    };
+    const onExit = (code, signal) => finish({ exited: true, code, signal });
+    // An 'error' event does not by itself mean the child has exited: only treat
+    // it as an exit once the child is confirmed to be no longer running.
+    const onError = () => {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        finish({ exited: true, code: child.exitCode, signal: child.signalCode });
+      }
+    };
+    const timer = setTimeout(() => finish({ exited: false }), timeoutMs);
+    child.once('exit', onExit);
+    child.once('error', onError);
+    // Close the listener race: if the child already exited before the listeners
+    // were attached, no 'exit' event will ever fire — resolve immediately.
+    if (child.exitCode !== null || child.signalCode !== null) {
+      finish({ exited: true, code: child.exitCode, signal: child.signalCode });
+    }
+  });
+}
+
+// Send SIGTERM, await a bounded exit, escalate to SIGKILL, then await again.
+// Idempotent and safe to call repeatedly; only ever signals the child it is given
+// (never an unrelated process). Never throws and never leaves a rejected promise.
+async function stopChild(child, timeoutMs = 5000) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) {
+    return { stopped: true, alreadyExited: true };
+  }
+  try {
+    child.kill('SIGTERM');
+  } catch {
+    /* already gone */
+  }
+  let result = await awaitChildExit(child, timeoutMs);
+  if (result.exited) return { stopped: true, signal: 'SIGTERM' };
+
+  // Still alive after the grace period → escalate to SIGKILL and await again.
+  try {
+    child.kill('SIGKILL');
+  } catch {
+    /* already gone */
+  }
+  result = await awaitChildExit(child, timeoutMs);
+  return result.exited
+    ? { stopped: true, signal: 'SIGKILL' }
+    : { stopped: false, timedOut: true };
 }
 
 function healthRequest(port, timeoutMs = 1000) {
@@ -306,7 +482,12 @@ async function testStartupFailures() {
     const capture = startCapture(child);
     const result = await waitForExit(child);
     await sleep(100); // let any trailing stdio flush
-    killServer(child);
+    const stopResult = await stopChild(child);
+    if (!stopResult.stopped) {
+      // Never ignore a shutdown failure: it must surface as a non-zero exit.
+      failed++;
+      failures.push(`${testCase.name}: child server did not terminate within the timeout`);
+    }
 
     assert(!result.timedOut, `${testCase.name}: process exits on its own`);
     assert(result.code !== 0, `${testCase.name}: exits with a non-zero code (got ${result.code})`);
@@ -365,13 +546,22 @@ async function testValidStartup() {
 // ══════════════════════════════════════════════════════════════════════════════
 async function cleanup() {
   try {
+    // Release the parent Mongoose connection first; the drop uses its own native
+    // client, which registers no models and cannot recreate the database.
     if (mongoose.connection.readyState !== 0) await mongoose.disconnect();
-    await mongoose.connect(TEST_URI, { serverSelectionTimeoutMS: 5000 });
-    await mongoose.connection.db.dropDatabase();
-    await mongoose.disconnect();
-    console.log(`  Cleanup: dropped ${TEST_DB_NAME} (a no-op if it was never created).`);
+    // Drop ONLY this run's isolated database with the native driver, then
+    // independently verify its absence (see dropIsolatedTestDb).
+    const result = await dropIsolatedTestDb();
+    if (!result || !result.verified) {
+      // Drop issued but absence could not be verified — never report cleanup
+      // success without verification.
+      failed++;
+      failures.push('cleanup: isolated database absence could not be verified');
+    }
   } catch (error) {
     console.error(`  Cleanup warning: ${error.message}`);
+    failed++;
+    failures.push('cleanup: isolated database could not be dropped or verified');
   }
 }
 
@@ -379,12 +569,24 @@ async function main() {
   console.log('FindLocal Phase 8 Stage 1 — Environment validation tests');
   console.log(`  Isolated database: ${TEST_DB_NAME}`);
 
+  // Refuse a remote database before any connection, spawn, or cleanup. Kept
+  // outside the try so a refusal prevents the finally-block cleanup from
+  // opening a database connection.
+  assertRemoteAllowed();
+
   try {
     testConfigValidation();
     await testStartupFailures();
     await testValidStartup();
   } finally {
-    killServer(server);
+    // Awaited, bounded shutdown on the failure path too (not just the success
+    // path in Section C): SIGTERM → wait → SIGKILL → wait.
+    const stopResult = await stopChild(server);
+    if (!stopResult.stopped) {
+      // Never ignore a shutdown failure: it must surface as a non-zero exit.
+      failed++;
+      failures.push('shutdown: child server did not terminate within the timeout');
+    }
     await cleanup();
   }
 

@@ -111,6 +111,7 @@ async function claimStockHold(reservationId) {
   const claim = await Inventory.updateOne(
     {
       _id: inventoryId,
+      isActive: true, // eligibility guard (atomic with the stock claim)
       heldReservations: { $ne: reservation._id }, // idempotency guard
       $expr: {
         $gte: [

@@ -28,7 +28,19 @@ const baseOptions = {
 
 // Broad limiter — applies to all API traffic (defence in depth; the per-route
 // limiters below are stricter than this one).
-const apiLimiter = rateLimit({ ...baseOptions, limit: limits.apiMax });
+// Health probes are exempt: the hosting platform polls them frequently, so they
+// must never consume the API quota. Matching uses req.originalUrl because this
+// limiter is mounted under /api/v1, where req.path would drop the mount prefix.
+// Only the liveness and readiness endpoints qualify — /api/v1/healthcheck does not.
+const apiLimiter = rateLimit({
+  ...baseOptions,
+  limit: limits.apiMax,
+  skip: (req) => {
+    const path = (req.originalUrl || '').split('?')[0];
+    const normalized = path.length > 1 ? path.replace(/\/+$/, '') : path;
+    return normalized === '/api/v1/health' || normalized === '/api/v1/health/ready';
+  },
+});
 
 // Strict limiter — repeated login/registration attempts are a credential-guessing
 // signal, so this is far tighter than the broad limiter.
