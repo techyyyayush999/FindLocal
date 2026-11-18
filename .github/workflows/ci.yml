@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  backend:
+    name: Backend test suites (PH3-PH12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ ping: 1 })'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      MONGO_URI: mongodb://127.0.0.1:27017/findlocal
+      JWT_SECRET: ci-only-jwt-secret-4f8a2c6e0b1d3f5a7c9e2b4d6f8a0c1e
+      CORS_ORIGIN: http://localhost:5199
+
+    defaults:
+      run:
+        working-directory: server
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install server dependencies
+        run: npm ci
+
+      - name: PH8 environment validation (ph8envtest.js)
+        run: node ph8envtest.js
+
+      - name: PH3 auth/session (ph3test.js)
+        run: node ph3test.js
+
+      - name: PH4 shop lifecycle (ph4test.js)
+        run: node ph4test.js
+
+      - name: PH6 search filters (ph6test.js)
+        run: node ph6test.js
+
+      - name: PH7 reservations (ph7test.js)
+        run: node ph7test.js
+
+      - name: PH8 security headers (ph8sectest.js)
+        run: node ph8sectest.js
+
+      - name: PH8 reliability (ph8reltest.js)
+        run: node ph8reltest.js
+
+      - name: PH8 hard boundary cases (ph8hardtest.js)
+        run: node ph8hardtest.js
+
+      - name: PH9 auth lifecycle (ph9authtest.js)
+        run: node ph9authtest.js
+
+      - name: PH10 IDOR isolation (ph10idortest.js)
+        run: node ph10idortest.js
+
+      - name: PH11 inventory concurrency (ph11concurrencytest.js)
+        run: node ph11concurrencytest.js
+
+      - name: PH12 reservation availability (ph12test.js)
+        run: node ph12test.js
+
+  frontend:
+    name: Frontend lint and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    defaults:
+      run:
+        working-directory: client
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: Install client dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
