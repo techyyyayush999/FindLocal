@@ -1,122 +1,63 @@
-import { useState } from 'react'
-import heroImg from './assets/hero.png'
-import reactLogo from './assets/react.svg'
-import viteLogo from './assets/vite.svg'
-import './App.css'
+import { Navigate, Route, Routes } from 'react-router-dom'
+import { RequireRole } from './components/RequireRole'
+import { CustomerShell } from './layouts/CustomerShell'
+import { AccountPage } from './pages/AccountPage'
+import { HomePage } from './pages/HomePage'
+import { LoginPage } from './pages/LoginPage'
+import { MyReservationsPage } from './pages/MyReservationsPage'
+import { NearbyPage } from './pages/NearbyPage'
+import { NotFoundPage } from './pages/NotFoundPage'
+import { RegisterPage } from './pages/RegisterPage'
+import { SearchPage } from './pages/SearchPage'
+import { ShopDetailPage } from './pages/ShopDetailPage'
+import { AdminDashboardPage } from './pages/admin/AdminDashboardPage'
+import { AdminProductsPage } from './pages/admin/AdminProductsPage'
+import { AdminShopsPage } from './pages/admin/AdminShopsPage'
+import { AdminUsersPage } from './pages/admin/AdminUsersPage'
+import { SellerDashboardPage } from './pages/seller/SellerDashboardPage'
+import { SellerInventoryPage } from './pages/seller/SellerInventoryPage'
+import { SellerProductsPage } from './pages/seller/SellerProductsPage'
+import { SellerReservationsPage } from './pages/seller/SellerReservationsPage'
+import { SellerShopPage } from './pages/seller/SellerShopPage'
 
-function App() {
-  const [count, setCount] = useState(0)
-
+export default function App() {
   return (
-    <>
-      <section id="center">
-        <div className="hero">
-          <img src={heroImg} className="base" width="170" height="179" alt="" />
-          <img src={reactLogo} className="framework" alt="React logo" />
-          <img src={viteLogo} className="vite" alt="Vite logo" />
-        </div>
-        <div>
-          <h1>Get started</h1>
-          <p>
-            Edit <code>src/App.jsx</code> and save to test <code>HMR</code>
-          </p>
-        </div>
-        <button
-          type="button"
-          className="counter"
-          onClick={() => setCount((count) => count + 1)}
-        >
-          Count is {count}
-        </button>
-      </section>
+    <Routes>
+      <Route element={<CustomerShell />}>
+        {/* ── Customer ─────────────────────────────────────────────── */}
+        <Route index element={<HomePage />} />
+        <Route path="nearby" element={<NearbyPage />} />
+        <Route path="search" element={<SearchPage />} />
+        <Route path="shops/:id" element={<ShopDetailPage />} />
+        <Route path="login" element={<LoginPage />} />
+        <Route path="register" element={<RegisterPage />} />
+        <Route path="account" element={<AccountPage />} />
+        <Route path="home" element={<Navigate to="/" replace />} />
 
-      <div className="ticks"></div>
+        {/* ── Customer (guarded) ───────────────────────────────────── */}
+        <Route element={<RequireRole allow={['customer']} />}>
+          <Route path="reservations" element={<MyReservationsPage />} />
+        </Route>
 
-      <section id="next-steps">
-        <div id="docs">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#documentation-icon"></use>
-          </svg>
-          <h2>Documentation</h2>
-          <p>Your questions, answered</p>
-          <ul>
-            <li>
-              <a href="https://vite.dev/" target="_blank">
-                <img className="logo" src={viteLogo} alt="" />
-                Explore Vite
-              </a>
-            </li>
-            <li>
-              <a href="https://react.dev/" target="_blank">
-                <img className="button-icon" src={reactLogo} alt="" />
-                Learn more
-              </a>
-            </li>
-          </ul>
-        </div>
-        <div id="social">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#social-icon"></use>
-          </svg>
-          <h2>Connect with us</h2>
-          <p>Join the Vite community</p>
-          <ul>
-            <li>
-              <a href="https://github.com/vitejs/vite" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#github-icon"></use>
-                </svg>
-                GitHub
-              </a>
-            </li>
-            <li>
-              <a href="https://chat.vite.dev/" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#discord-icon"></use>
-                </svg>
-                Discord
-              </a>
-            </li>
-            <li>
-              <a href="https://x.com/vite_js" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#x-icon"></use>
-                </svg>
-                X.com
-              </a>
-            </li>
-            <li>
-              <a href="https://bsky.app/profile/vite.dev" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#bluesky-icon"></use>
-                </svg>
-                Bluesky
-              </a>
-            </li>
-          </ul>
-        </div>
-      </section>
+        {/* ── Seller (guarded) ─────────────────────────────────────── */}
+        <Route element={<RequireRole allow={['seller']} />}>
+          <Route path="seller" element={<SellerDashboardPage />} />
+          <Route path="seller/shop" element={<SellerShopPage />} />
+          <Route path="seller/inventory" element={<SellerInventoryPage />} />
+          <Route path="seller/products" element={<SellerProductsPage />} />
+          <Route path="seller/reservations" element={<SellerReservationsPage />} />
+        </Route>
 
-      <div className="ticks"></div>
-      <section id="spacer"></section>
-    </>
+        {/* ── Admin (guarded) ──────────────────────────────────────── */}
+        <Route element={<RequireRole allow={['admin']} />}>
+          <Route path="admin" element={<AdminDashboardPage />} />
+          <Route path="admin/shops" element={<AdminShopsPage />} />
+          <Route path="admin/products" element={<AdminProductsPage />} />
+          <Route path="admin/users" element={<AdminUsersPage />} />
+        </Route>
+
+        <Route path="*" element={<NotFoundPage />} />
+      </Route>
+    </Routes>
   )
 }
-
-export default App
