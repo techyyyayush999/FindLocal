@@ -995,16 +995,32 @@ async function testA15_concurrentCancelVsPickup() {
     quantity: 2,
   });
 
-  const [c, p] = await Promise.all([
-    svc.settleReservation(r._id, 'CANCEL'),
-    svc.settleReservation(r._id, 'FULFILL'),
-  ]);
+  // Start barrier: both settlers are armed behind a shared gate and released
+  // together, so they interleave on the shared reservation/inventory documents
+  // instead of relying solely on Promise.all's scheduling.
+  let openGate;
+  const gate = new Promise((resolve) => (openGate = resolve));
+  const cancelP = (async () => {
+    await gate;
+    return svc.settleReservation(r._id, 'CANCEL');
+  })();
+  const pickP = (async () => {
+    await gate;
+    return svc.settleReservation(r._id, 'FULFILL');
+  })();
+  openGate();
+  const [c, p] = await Promise.all([cancelP, pickP]);
 
   const inv = await readInv(inventory._id);
   assert(inv.reservedQuantity === 0, `reservedQuantity settles to 0 (got ${inv.reservedQuantity})`);
   assert((inv.heldReservations || []).length === 0, 'marker removed');
   const wins = (c.ok ? 1 : 0) + (p.ok ? 1 : 0);
   assert(wins === 1, `exactly one operation took effect (got ${wins})`);
+  const loser = c.ok ? p : c;
+  assert(
+    loser.ok === false && (loser.reason === 'CONFLICT' || loser.reason === 'ALREADY_CONSUMED'),
+    `loser reports a conflict, never success (got ${JSON.stringify(loser)})`
+  );
 
   const res = await readRes(r._id);
   if (c.ok) {
@@ -1285,6 +1301,138 @@ async function testA19_expirySweeper() {
   // After stop(), the sweeper no longer fires and there is nothing left to do.
   const stopped = await svc.createExpirySweeper({ enabled: false }).run();
   assert(stopped.scanned === 0, 'post-stop sweep finds nothing left');
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION A4 — Stage 13D: guarded terminal settlement (A15 race hardening)
+// ══════════════════════════════════════════════════════════════════════════════
+
+async function testA20_guardedTerminalSettlement() {
+  section('A20. Guarded terminal settlement: no false success, no overwrite');
+
+  // (a) CANCEL must NOT report success when a concurrent pickup has already done
+  //     the stock half but not yet written its derived state — the exact A15
+  //     two-write gap (marker removed, holdState still HELD). Simulated
+  //     deterministically so the interleaving is exercised without relying on
+  //     Promise.all scheduling.
+  const c1 = await makeUser('customer');
+  const l1 = await makeListing({ quantity: 5 });
+  const r1 = await makeActiveReservation({
+    customerId: c1._id, shopId: l1.shop._id, productId: l1.product._id,
+    inventoryId: l1.inventory._id, quantity: 2,
+  });
+  await Inventory.updateOne(
+    { _id: l1.inventory._id, heldReservations: r1._id },
+    { $inc: { quantity: -2, reservedQuantity: -2 }, $pull: { heldReservations: r1._id } }
+  );
+  const gap = await readRes(r1._id);
+  assert(gap.status === 'ACTIVE' && gap.holdState === 'HELD',
+    `gap precondition: ACTIVE/HELD, marker gone (got ${gap.status}/${gap.holdState})`);
+
+  const cancelGap = await svc.settleReservation(r1._id, 'CANCEL');
+  assert(cancelGap.ok === false,
+    `cancel during the consume gap must NOT report success (got ${JSON.stringify(cancelGap)})`);
+  assert(cancelGap.reason === 'CONFLICT',
+    `cancel during the consume gap reports CONFLICT (got ${cancelGap.reason})`);
+  const afterGap = await readRes(r1._id);
+  assert(afterGap.status === 'ACTIVE',
+    `loser did not overwrite a terminal status (got ${afterGap.status})`);
+  const invGap = await readInv(l1.inventory._id);
+  assert(invGap.quantity === 3, `the single stock effect stands (got ${invGap.quantity})`);
+  assert(invGap.reservedQuantity === 0, `reservedQuantity 0 (got ${invGap.reservedQuantity})`);
+
+  // (b) PICKUP loses to a release → CONFLICT, stock NOT consumed, status converges.
+  const c2 = await makeUser('customer');
+  const l2 = await makeListing({ quantity: 5 });
+  const r2 = await makeActiveReservation({
+    customerId: c2._id, shopId: l2.shop._id, productId: l2.product._id,
+    inventoryId: l2.inventory._id, quantity: 2,
+  });
+  await svc.releaseStockHold(r2._id); // release half performed; close not reached
+  const pickLose = await svc.settleReservation(r2._id, 'FULFILL');
+  assert(pickLose.ok === false, `pickup loses to release (got ${JSON.stringify(pickLose)})`);
+  assert(pickLose.reason === 'CONFLICT', `pickup-lose reason CONFLICT (got ${pickLose.reason})`);
+  const inv2 = await readInv(l2.inventory._id);
+  assert(inv2.quantity === 5, `pickup loser did not consume stock (got ${inv2.quantity})`);
+  assert(inv2.reservedQuantity === 0, `hold released (got ${inv2.reservedQuantity})`);
+  const res2 = await readRes(r2._id);
+  assert(res2.status === 'CANCELLED', `pickup loser converges to CANCELLED (got ${res2.status})`);
+
+  // (c) A losing terminal writer cannot overwrite the winner (CAS guard).
+  const c3 = await makeUser('customer');
+  const l3 = await makeListing({ quantity: 5 });
+  const r3 = await makeActiveReservation({
+    customerId: c3._id, shopId: l3.shop._id, productId: l3.product._id,
+    inventoryId: l3.inventory._id, quantity: 2,
+  });
+  const winner = await svc.settleReservation(r3._id, 'CANCEL');
+  assert(winner.ok === true && winner.status === 'CANCELLED', 'precondition: cancel won');
+  const lostClose = await svc.closeReservation(r3._id, 'FULFILLED');
+  assert(lostClose.closed === false,
+    `CAS refuses to overwrite a terminal status (got ${JSON.stringify(lostClose)})`);
+  const res3 = await readRes(r3._id);
+  assert(res3.status === 'CANCELLED', `winner status preserved (got ${res3.status})`);
+
+  // (d) W-settle release recovery via settleReservation stays a success and
+  //     never double-releases.
+  const c4 = await makeUser('customer');
+  const l4 = await makeListing({ quantity: 5 });
+  const r4 = await makeActiveReservation({
+    customerId: c4._id, shopId: l4.shop._id, productId: l4.product._id,
+    inventoryId: l4.inventory._id, quantity: 2,
+  });
+  await svc.releaseStockHold(r4._id); // crash window: OPEN + RELEASED
+  const recRelease = await svc.settleReservation(r4._id, 'CANCEL');
+  assert(recRelease.ok === true && recRelease.status === 'CANCELLED',
+    `W-settle release finalized by cancel (got ${JSON.stringify(recRelease)})`);
+  const inv4 = await readInv(l4.inventory._id);
+  assert(inv4.reservedQuantity === 0, `W-settle release: no double release (got ${inv4.reservedQuantity})`);
+  assert(inv4.quantity === 5, `W-settle release: quantity untouched (got ${inv4.quantity})`);
+
+  // (e) W-settle consume recovery via settleReservation stays a success and
+  //     never double-consumes.
+  const c5 = await makeUser('customer');
+  const l5 = await makeListing({ quantity: 5 });
+  const r5 = await makeActiveReservation({
+    customerId: c5._id, shopId: l5.shop._id, productId: l5.product._id,
+    inventoryId: l5.inventory._id, quantity: 2,
+  });
+  await svc.consumeStockHold(r5._id); // crash window: OPEN + CONSUMED
+  const recConsume = await svc.settleReservation(r5._id, 'FULFILL');
+  assert(recConsume.ok === true && recConsume.status === 'FULFILLED',
+    `W-settle consume finalized by pickup (got ${JSON.stringify(recConsume)})`);
+  const inv5 = await readInv(l5.inventory._id);
+  assert(inv5.quantity === 3, `W-settle consume: no double consume (got ${inv5.quantity})`);
+  assert(inv5.reservedQuantity === 0, `W-settle consume: reservedQuantity 0 (got ${inv5.reservedQuantity})`);
+
+  // (f) Repeated cancel after settling stays idempotent (no extra stock effect).
+  const repeat = await svc.settleReservation(r4._id, 'CANCEL');
+  assert(repeat.ok === true && repeat.alreadySettled === true,
+    `repeat cancel idempotent (got ${JSON.stringify(repeat)})`);
+  const inv4b = await readInv(l4.inventory._id);
+  assert(inv4b.reservedQuantity === 0, `repeat cancel: still 0 (got ${inv4b.reservedQuantity})`);
+  assert(inv4b.quantity === 5, `repeat cancel: quantity still 5 (got ${inv4b.quantity})`);
+
+  // (g) Expiry sweep correctly classifies a row a pickup already consumed (NOT
+  //     EXPIRED) and remains idempotent.
+  const c6 = await makeUser('customer');
+  const l6 = await makeListing({ quantity: 5 });
+  const r6 = await makeActiveReservation({
+    customerId: c6._id, shopId: l6.shop._id, productId: l6.product._id,
+    inventoryId: l6.inventory._id, quantity: 2, expiresAt: PAST(),
+  });
+  await svc.consumeStockHold(r6._id); // pickup won the stock half; close crashed
+  const sweep1 = await svc.expireReservations({ shopId: l6.shop._id, limit: 50 });
+  assert(sweep1.scanned === 1, `sweep scans the overdue row (got ${sweep1.scanned})`);
+  assert(sweep1.expired === 0, `consume-won row is NOT reported expired (got ${sweep1.expired})`);
+  assert(sweep1.fulfilled === 1, `consume-won row is reported fulfilled (got ${sweep1.fulfilled})`);
+  const res6 = await readRes(r6._id);
+  assert(res6.status === 'FULFILLED', `consume-won row finalized FULFILLED (got ${res6.status})`);
+  const sweep2 = await svc.expireReservations({ shopId: l6.shop._id, limit: 50 });
+  assert(sweep2.scanned === 0, `repeat sweep idempotent (got ${sweep2.scanned})`);
+  const inv6 = await readInv(l6.inventory._id);
+  assert(inv6.quantity === 3, `consume applied exactly once (got ${inv6.quantity})`);
+  assert(inv6.reservedQuantity === 0, `sweep left reservedQuantity 0 (got ${inv6.reservedQuantity})`);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1845,6 +1993,9 @@ async function main() {
     // ── Section A3 — Stage 5 hardening (F1/F2) ───────────────────────────────
     await testA18_recoveryDoesNotReclaim();
     await testA19_expirySweeper();
+
+    // ── Section A4 — Stage 13D guarded terminal settlement ───────────────────
+    await testA20_guardedTerminalSettlement();
   } catch (err) {
     console.error('\nUnexpected error in Section A:', err.message);
     failed++;

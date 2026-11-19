@@ -265,12 +265,18 @@ async function classifyUnsettledHold(reservationId) {
   return 'NOT_HELD';
 }
 
-// ─── Terminal transition: set status + unset activeKey (frees the unique index) ─
+// ─── Terminal transition: CAS set status + unset activeKey (frees the index) ──
+// Atomic compare-and-set: ONLY an OPEN reservation (PENDING / ACTIVE) may
+// transition to a terminal status. A losing terminal writer — one that races
+// another terminal transition and arrives after the winner — matches 0 documents
+// and is reported as a lost close, so callers surface a conflict instead of
+// silently overwriting CANCELLED / FULFILLED / EXPIRED. Returns { closed, status }.
 async function closeReservation(reservationId, status) {
-  await Reservation.updateOne(
-    { _id: reservationId },
+  const result = await Reservation.updateOne(
+    { _id: reservationId, status: { $in: RESERVATION_OPEN_STATUSES } },
     { $set: { status, settledAt: new Date() }, $unset: { activeKey: '' } }
   );
+  return { closed: result.matchedCount === 1, status };
 }
 
 // ─── Ensure an open reservation is ACTIVE + HELD (only while still open) ──────
@@ -482,8 +488,10 @@ async function reconcileInventory(inventoryId) {
 //   1. `releaseStockHold` (cancel / expiry) or `consumeStockHold` (pickup) — both
 //      membership-guarded and idempotent, so stock is released at most once and
 //      consumed at most once, no matter how many concurrent / repeated callers.
-//   2. `closeReservation(status)` — the terminal status + `settledAt`, and
-//      `$unset activeKey` so the unique partial index frees up.
+//   2. `closeReservation(status)` — a CAS that ONLY an OPEN reservation may
+//      satisfy, writing the terminal status + `settledAt` and `$unset activeKey`
+//      so the unique partial index frees up. A losing terminal writer matches 0
+//      and never overwrites CANCELLED / FULFILLED / EXPIRED.
 //
 // A crash between (1) and (2) leaves the reservation OPEN but no longer holding
 // stock; the `holdState` written in (1) records which settlement happened, and
@@ -499,7 +507,8 @@ async function reconcileInventory(inventoryId) {
 //   { ok:true,  status, alreadySettled:true }     — repeat of an identical transition
 //   { ok:false, reason:'EXPIRED', status }        — past expiry; pickup refused, hold released
 //   { ok:false, reason:'NOT_ACTIVE', status }     — PENDING; not yet pickable
-//   { ok:false, reason:'CONFLICT', status }       — incompatible terminal already set
+//   { ok:false, reason:'CONFLICT', status }       — incompatible terminal already set, or this
+//                                                   call lost the settlement race
 //   { ok:false, reason:'ALREADY_CONSUMED', status }
 //   { ok:false, reason:'INSUFFICIENT_STOCK', status }
 //   { ok:false, reason:'NOT_FOUND' }
@@ -580,10 +589,22 @@ async function settleReservation(reservationId, intent) {
   }
 
   // ── CANCEL / EXPIRE (release path) ──────────────────────────────────────────
+  const targetStatus =
+    intent === 'EXPIRE' || expired
+      ? RESERVATION_STATUSES.EXPIRED
+      : RESERVATION_STATUSES.CANCELLED;
+
   const rel = await releaseStockHold(reservation._id);
 
+  // (1) THIS call performed the release → a genuine, exactly-once stock release.
+  if (rel.released === true) {
+    await closeReservation(reservation._id, targetStatus);
+    return { ok: true, status: targetStatus };
+  }
+
+  // (2) A pickup already consumed the stock (this call, or a lost state write) →
+  //     converge on the true terminal, FULFILLED. Never report cancel success.
   if (rel.reason === 'ALREADY_CONSUMED') {
-    // Stock was physically taken (a pickup won) — the true terminal is FULFILLED.
     await closeReservation(reservation._id, RESERVATION_STATUSES.FULFILLED);
     return {
       ok: false,
@@ -592,13 +613,43 @@ async function settleReservation(reservationId, intent) {
     };
   }
 
-  // released | ALREADY_RELEASED | NOT_HELD → the hold is not (or no longer) ours.
-  const status =
-    intent === 'EXPIRE' || expired
-      ? RESERVATION_STATUSES.EXPIRED
-      : RESERVATION_STATUSES.CANCELLED;
-  await closeReservation(reservation._id, status);
-  return { ok: true, status };
+  // (3) The hold was already released (a repeat cancel/expiry, or a W-settle
+  //     release whose close never completed) → finalize idempotently. Safe: the
+  //     derived state proves the release already happened exactly once.
+  if (rel.reason === 'ALREADY_RELEASED') {
+    await closeReservation(reservation._id, targetStatus);
+    return { ok: true, status: targetStatus };
+  }
+
+  // (4) `NOT_HELD` — the marker is absent but the derived state is neither
+  //     RELEASED nor CONSUMED. This is the ambiguous window behind the A15 race:
+  //     it is either a concurrent consume whose `holdState` write has not landed
+  //     yet, a concurrent release, or a genuinely never-claimed PENDING row.
+  //     Re-read authoritative state and only treat it as a release when NOTHING
+  //     was ever held — never report success merely because the marker is gone.
+  const current = await Reservation.findById(reservation._id).select(
+    'status +holdState'
+  );
+
+  // Nothing was ever claimed (fresh PENDING / UNCLAIMED): cancelling / expiring
+  // is legitimate and touches no stock.
+  if (
+    current &&
+    current.status === RESERVATION_STATUSES.PENDING &&
+    current.holdState === HOLD_STATES.UNCLAIMED
+  ) {
+    await closeReservation(reservation._id, targetStatus);
+    return { ok: true, status: targetStatus };
+  }
+
+  // Any other shape overlaps an in-flight (or crashed) settlement. Never fabricate
+  // success and never overwrite the winner's terminal status; the CAS in
+  // `closeReservation` is the final guard against a lost compare-and-set.
+  return {
+    ok: false,
+    reason: 'CONFLICT',
+    status: current ? current.status : reservation.status,
+  };
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
